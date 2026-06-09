@@ -4544,6 +4544,7 @@ def block_task(
     *,
     reason: Optional[str] = None,
     kind: Optional[str] = None,
+    metadata: Optional[dict] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
@@ -4577,6 +4578,13 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+
+    def _event_payload(**extra: Any) -> dict:
+        payload = {"reason": reason, **extra}
+        if isinstance(metadata, dict) and metadata.get("blocker_classification"):
+            payload["classification"] = metadata["blocker_classification"]
+        return payload
+
     routed_to = "blocked"
     recurrences = 0
     with write_txn(conn):
@@ -4619,14 +4627,18 @@ def block_task(
                 conn, task_id,
                 outcome="blocked", status="blocked",
                 summary=reason,
+                metadata=metadata,
             )
-            if run_id is None and reason:
+            if run_id is None and (reason or metadata):
                 run_id = _synthesize_ended_run(
-                    conn, task_id, outcome="blocked", summary=reason,
+                    conn, task_id,
+                    outcome="blocked",
+                    summary=reason,
+                    metadata=metadata,
                 )
             _append_event(
                 conn, task_id, "dependency_wait",
-                {"reason": reason, "kind": kind}, run_id=run_id,
+                _event_payload(kind=kind), run_id=run_id,
             )
             routed_to = "todo"
             _blocked_task = get_task(conn, task_id)
@@ -4673,19 +4685,22 @@ def block_task(
                 conn, task_id,
                 outcome="blocked", status="blocked",
                 summary=reason,
+                metadata=metadata,
             )
-            if run_id is None and reason:
+            if run_id is None and (reason or metadata):
                 run_id = _synthesize_ended_run(
-                    conn, task_id, outcome="blocked", summary=reason,
+                    conn, task_id,
+                    outcome="blocked",
+                    summary=reason,
+                    metadata=metadata,
                 )
             _append_event(
                 conn, task_id, "block_loop_detected",
-                {
-                    "reason": reason,
-                    "kind": kind,
-                    "recurrences": recurrences,
-                    "limit": BLOCK_RECURRENCE_LIMIT,
-                },
+                _event_payload(
+                    kind=kind,
+                    recurrences=recurrences,
+                    limit=BLOCK_RECURRENCE_LIMIT,
+                ),
                 run_id=run_id,
             )
             routed_to = "triage"
@@ -4727,18 +4742,20 @@ def block_task(
                 conn, task_id,
                 outcome="blocked", status="blocked",
                 summary=reason,
+                metadata=metadata,
             )
             # Synthesize a run when blocking a never-claimed task so the
             # reason is preserved in attempt history.
-            if run_id is None and reason:
+            if run_id is None and (reason or metadata):
                 run_id = _synthesize_ended_run(
                     conn, task_id,
                     outcome="blocked",
                     summary=reason,
+                    metadata=metadata,
                 )
             _append_event(
                 conn, task_id, "blocked",
-                {"reason": reason, "kind": kind, "recurrences": recurrences},
+                _event_payload(kind=kind, recurrences=recurrences),
                 run_id=run_id,
             )
         _blocked_task = get_task(conn, task_id)

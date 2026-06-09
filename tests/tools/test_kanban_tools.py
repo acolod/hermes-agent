@@ -496,6 +496,70 @@ def test_complete_rejects_non_dict_metadata(worker_env):
     assert json.loads(out).get("error")
 
 
+def test_complete_accepts_valid_evidence_contract(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    evidence = {
+        "changed_files": ["tools/kanban_tools.py"],
+        "tests_run": ["python -m pytest tests/tools/test_kanban_tools.py -q"],
+        "tests_passed": True,
+        "artifact_paths": [],
+        "verification_notes": ["focused tool tests passed"],
+        "restart_required": False,
+        "pending_activation": False,
+        "rollback": ["git checkout -- tools/kanban_tools.py"],
+    }
+
+    out = kt._handle_complete({
+        "summary": "completed with evidence contract",
+        "metadata": evidence,
+    })
+    assert json.loads(out)["ok"] is True
+
+    conn = kb.connect()
+    try:
+        run = kb.latest_run(conn, worker_env)
+        assert run is not None
+        assert run.metadata == evidence
+    finally:
+        conn.close()
+
+
+def test_complete_rejects_malformed_evidence_contract(worker_env):
+    from tools import kanban_tools as kt
+
+    out = kt._handle_complete({
+        "summary": "bad evidence",
+        "metadata": {
+            "changed_files": "tools/kanban_tools.py",
+            "tests_passed": "yes",
+        },
+    })
+    err = json.loads(out).get("error", "")
+    assert "metadata.changed_files must be a list of strings" in err
+    assert "metadata.tests_passed must be a boolean" in err
+
+
+def test_complete_legacy_metadata_without_evidence_keys_still_passes(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    out = kt._handle_complete({
+        "summary": "legacy metadata",
+        "metadata": {"files": 2, "note": "kept for compatibility"},
+    })
+    assert json.loads(out)["ok"] is True
+
+    conn = kb.connect()
+    try:
+        run = kb.latest_run(conn, worker_env)
+        assert run is not None
+        assert run.metadata == {"files": 2, "note": "kept for compatibility"}
+    finally:
+        conn.close()
+
+
 def test_complete_phantom_card_message_advertises_retry(worker_env):
     """A phantom-card rejection must surface a tool_error that explicitly
     tells the worker the task is still in-flight and how to retry — the
@@ -704,6 +768,60 @@ def test_block_happy_path(worker_env):
         assert kb.get_task(conn, worker_env).status == "blocked"
     finally:
         conn.close()
+
+
+def test_block_accepts_valid_classification(worker_env):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    classification = {
+        "blocker_type": "safe_false_positive_clear",
+        "owner": "blocker-reviewer",
+        "requires_human": False,
+        "retry_policy": "once",
+        "resume_condition": "review finding disproved against live tree",
+        "evidence": "tests show the referenced file exists",
+    }
+    out = kt._handle_block({
+        "reason": "review finding appears to be a false positive",
+        "classification": classification,
+    })
+    assert json.loads(out)["ok"] is True
+
+    conn = kb.connect()
+    try:
+        events = kb.list_events(conn, worker_env)
+        blocked = [event for event in events if event.kind == "blocked"][-1]
+        assert blocked.payload is not None
+        assert blocked.payload["classification"] == classification
+        run = kb.latest_run(conn, worker_env)
+        assert run is not None
+        assert run.metadata == {"blocker_classification": classification}
+    finally:
+        conn.close()
+
+
+def test_block_rejects_invalid_classification(worker_env):
+    from tools import kanban_tools as kt
+
+    out = kt._handle_block({
+        "reason": "bad classifier",
+        "classification": {
+            "blocker_type": "maybe",
+            "owner": "nobody",
+            "requires_human": "no",
+            "retry_policy": "forever",
+            "resume_condition": ["not", "string"],
+            "evidence": 123,
+        },
+    })
+    err = json.loads(out).get("error", "")
+    assert "classification.blocker_type must be one of" in err
+    assert "classification.owner must be one of" in err
+    assert "classification.requires_human must be a boolean" in err
+    assert "classification.retry_policy must be one of" in err
+    assert "classification.resume_condition must be a string" in err
+    assert "classification.evidence must be a string" in err
 
 
 def test_block_rejects_empty_reason(worker_env):
@@ -975,6 +1093,42 @@ def test_create_happy_path(worker_env):
         child = kb.get_task(conn, d["task_id"])
         assert child.title == "child task"
         assert child.assignee == "peer"
+    finally:
+        conn.close()
+
+
+def test_create_renders_structured_work_order_body(worker_env):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    out = kt._handle_create({
+        "title": "work-order child",
+        "assignee": "janitor",
+        "work_order": {
+            "goal": "Build the helper behavior.",
+            "scope": "Touch kanban tools only.",
+            "out_of_scope": "No DB migration.",
+            "done_means": "Focused tests pass.",
+            "verification": "python -m pytest tests/tools/test_kanban_tools.py -q",
+            "auto_fix_allowed": "Small test fixture updates.",
+            "requires_alex": "Schema migration decision.",
+            "routing": "janitor implements, reviewer checks.",
+            "final_handoff": "Done + evidence.",
+        },
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+
+    conn = kb.connect()
+    try:
+        child = kb.get_task(conn, d["task_id"])
+        assert child is not None
+        body = child.body
+        assert body is not None
+        assert "## Goal\nBuild the helper behavior." in body
+        assert "## Out of Scope\nNo DB migration." in body
+        assert "## Done Means\nFocused tests pass." in body
+        assert "## Final Handoff\nDone + evidence." in body
     finally:
         conn.close()
 

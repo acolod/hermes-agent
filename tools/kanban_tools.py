@@ -96,6 +96,148 @@ def _check_kanban_orchestrator_mode() -> bool:
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
+_EVIDENCE_LIST_FIELDS = {
+    "changed_files",
+    "tests_run",
+    "artifact_paths",
+    "verification_notes",
+    "rollback",
+}
+_EVIDENCE_BOOL_FIELDS = {
+    "tests_passed",
+    "restart_required",
+    "pending_activation",
+}
+_EVIDENCE_FIELDS = _EVIDENCE_LIST_FIELDS | _EVIDENCE_BOOL_FIELDS
+
+_BLOCKER_TYPES = {
+    "safe_auto_fix",
+    "safe_false_positive_clear",
+    "external_tool_lane_issue",
+    "reviewer_required",
+    "alex_required",
+    "abort_replacement_needed",
+}
+_BLOCKER_OWNERS = {
+    "default",
+    "researcher",
+    "janitor",
+    "reviewer",
+    "blocker-reviewer",
+    "alex",
+}
+_BLOCKER_RETRY_POLICIES = {
+    "none",
+    "once",
+    "after_cooldown",
+    "after_quota_reset",
+    "replacement_task",
+}
+
+
+def _format_allowed(values: set[str]) -> str:
+    return ", ".join(sorted(values))
+
+
+def _validate_evidence_metadata(metadata: Optional[dict]) -> Optional[str]:
+    """Validate the optional work-order evidence contract in metadata.
+
+    Legacy metadata remains free-form. The validator activates only when a
+    worker supplies one of the evidence-contract keys, so older handoffs like
+    ``{"files": 2}`` keep working while malformed structured evidence gets a
+    clear rejection before task completion mutates board state.
+    """
+    if not isinstance(metadata, dict):
+        return None
+    if not any(key in metadata for key in _EVIDENCE_FIELDS):
+        return None
+
+    errors: list[str] = []
+    for key in sorted(_EVIDENCE_LIST_FIELDS):
+        if key not in metadata:
+            continue
+        value = metadata.get(key)
+        if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+            errors.append(f"metadata.{key} must be a list of strings")
+    for key in sorted(_EVIDENCE_BOOL_FIELDS):
+        if key not in metadata:
+            continue
+        if not isinstance(metadata.get(key), bool):
+            errors.append(f"metadata.{key} must be a boolean")
+    return "; ".join(errors) if errors else None
+
+
+def _validate_blocker_classification(value: Any) -> tuple[Optional[dict], Optional[str]]:
+    """Validate optional structured blocker metadata for kanban_block."""
+    if value is None:
+        return None, None
+    if not isinstance(value, dict):
+        return None, "classification must be an object/dict"
+
+    errors: list[str] = []
+    classification = dict(value)
+    blocker_type = classification.get("blocker_type")
+    if blocker_type is not None and blocker_type not in _BLOCKER_TYPES:
+        errors.append(
+            "classification.blocker_type must be one of: "
+            f"{_format_allowed(_BLOCKER_TYPES)}"
+        )
+    owner = classification.get("owner")
+    if owner is not None and owner not in _BLOCKER_OWNERS:
+        errors.append(
+            "classification.owner must be one of: "
+            f"{_format_allowed(_BLOCKER_OWNERS)}"
+        )
+    retry_policy = classification.get("retry_policy")
+    if retry_policy is not None and retry_policy not in _BLOCKER_RETRY_POLICIES:
+        errors.append(
+            "classification.retry_policy must be one of: "
+            f"{_format_allowed(_BLOCKER_RETRY_POLICIES)}"
+        )
+    requires_human = classification.get("requires_human")
+    if requires_human is not None and not isinstance(requires_human, bool):
+        errors.append("classification.requires_human must be a boolean")
+    for key in ("resume_condition", "evidence"):
+        if key in classification and not isinstance(classification.get(key), str):
+            errors.append(f"classification.{key} must be a string")
+    return classification, "; ".join(errors) if errors else None
+
+
+_WORK_ORDER_SECTIONS = (
+    ("goal", "Goal"),
+    ("scope", "Scope"),
+    ("out_of_scope", "Out of Scope"),
+    ("done_means", "Done Means"),
+    ("verification", "Verification"),
+    ("auto_fix_allowed", "Auto-Fix Allowed"),
+    ("requires_alex", "Requires Alex"),
+    ("routing", "Routing"),
+    ("final_handoff", "Final Handoff"),
+)
+
+
+def _render_work_order_body(value: Any) -> tuple[Optional[str], Optional[str]]:
+    """Render a structured work-order object into the standard card body."""
+    if value is None:
+        return None, None
+    if not isinstance(value, dict):
+        return None, "work_order must be an object/dict"
+
+    parts: list[str] = []
+    for key, heading in _WORK_ORDER_SECTIONS:
+        raw = value.get(key)
+        if raw is None:
+            continue
+        if isinstance(raw, (list, tuple)):
+            body = "\n".join(f"- {str(item).strip()}" for item in raw if str(item).strip())
+        else:
+            body = str(raw).strip()
+        if body:
+            parts.append(f"## {heading}\n{body}")
+    if not parts:
+        return None, "work_order must include at least one non-empty section"
+    return "\n\n".join(parts), None
+
 
 def _default_task_id(arg: Optional[str]) -> Optional[str]:
     """Resolve ``task_id`` arg or fall back to the env var the dispatcher set."""
@@ -103,7 +245,6 @@ def _default_task_id(arg: Optional[str]) -> Optional[str]:
         return arg
     env_tid = os.environ.get("HERMES_KANBAN_TASK")
     return env_tid or None
-
 
 def _worker_run_id(task_id: str) -> Optional[int]:
     """Return this worker's dispatcher run id when it is scoped to task_id."""
@@ -587,6 +728,9 @@ def _handle_complete(args: dict, **kw) -> str:
         return tool_error(
             f"metadata must be an object/dict, got {type(metadata).__name__}"
         )
+    evidence_error = _validate_evidence_metadata(metadata)
+    if evidence_error:
+        return tool_error(evidence_error)
     metadata = _stamp_worker_session_metadata(tid, metadata)
     board = args.get("board")
     try:
@@ -680,6 +824,12 @@ def _handle_block(args: dict, **kw) -> str:
         return tool_error("reason is required — explain what input you need")
     reason = redact_sensitive_text(str(reason), force=True)
     kind = args.get("kind")
+    classification, classification_error = _validate_blocker_classification(
+        args.get("classification")
+    )
+    if classification_error:
+        return tool_error(classification_error)
+    metadata = {"blocker_classification": classification} if classification else None
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -717,6 +867,7 @@ def _handle_block(args: dict, **kw) -> str:
                 conn, tid,
                 reason=reason,
                 kind=kind,
+                metadata=metadata,
                 expected_run_id=_worker_run_id(tid),
             )
             if not ok:
@@ -847,6 +998,11 @@ def _handle_create(args: dict, **kw) -> str:
             "task (the dispatcher will only spawn tasks with an assignee)"
         )
     body = args.get("body")
+    work_order_body, work_order_error = _render_work_order_body(args.get("work_order"))
+    if work_order_error:
+        return tool_error(work_order_error)
+    if body is None and work_order_body is not None:
+        body = work_order_body
     parents = args.get("parents") or []
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
     # Stamp the originating session id when the agent loop runs under
@@ -1232,9 +1388,13 @@ KANBAN_COMPLETE_SCHEMA = {
                 "type": "object",
                 "description": (
                     "Free-form dict of structured facts about this "
-                    "attempt — {\"changed_files\": [...], \"tests_run\": 12, "
-                    "\"findings\": [...]}. Surfaced to downstream "
-                    "workers alongside ``summary``."
+                    "attempt. If you include evidence-contract keys, "
+                    "they are validated before completion: changed_files, "
+                    "tests_run, artifact_paths, verification_notes, and "
+                    "rollback must be lists of strings; tests_passed, "
+                    "restart_required, and pending_activation must be "
+                    "booleans. Legacy metadata without these keys remains "
+                    "free-form."
                 ),
             },
             "result": {
@@ -1323,6 +1483,22 @@ KANBAN_BLOCK_SCHEMA = {
                     "Why you're blocked. 'dependency' waits in todo and "
                     "resumes automatically; the others surface to a human. "
                     "Omit only if none apply."
+                ),
+            },
+            "classification": {
+                "type": "object",
+                "description": (
+                    "Optional structured blocker classification. Valid "
+                    "blocker_type values: safe_auto_fix, "
+                    "safe_false_positive_clear, external_tool_lane_issue, "
+                    "reviewer_required, alex_required, "
+                    "abort_replacement_needed. Valid owners: default, "
+                    "researcher, janitor, reviewer, blocker-reviewer, alex. "
+                    "Valid retry_policy values: none, once, after_cooldown, "
+                    "after_quota_reset, replacement_task. requires_human "
+                    "must be boolean; resume_condition and evidence must "
+                    "be strings. Stored on the blocked run/event without a "
+                    "DB schema migration."
                 ),
             },
             "board": _board_schema_prop(),
@@ -1419,6 +1595,17 @@ KANBAN_CREATE_SCHEMA = {
                     "Opening post: full spec, acceptance criteria, "
                     "links. The assigned worker reads this as part of "
                     "its context."
+                ),
+            },
+            "work_order": {
+                "type": "object",
+                "description": (
+                    "Optional structured work-order object. When body is "
+                    "omitted, this renders into the standard task body "
+                    "sections: goal, scope, out_of_scope, done_means, "
+                    "verification, auto_fix_allowed, requires_alex, "
+                    "routing, and final_handoff. Explicit body wins for "
+                    "backward compatibility."
                 ),
             },
             "parents": {
