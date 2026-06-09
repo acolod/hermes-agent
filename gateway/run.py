@@ -229,6 +229,26 @@ def _non_conversational_metadata(
     return merged
 
 
+def _load_approval_translation(description: str) -> str:
+    """Return a human-friendly approval description when a translation exists."""
+
+    try:
+        trans_path = get_hermes_home() / "approval-translations.json"
+        if trans_path.exists():
+            with open(trans_path, encoding="utf-8") as f:
+                table = json.load(f)
+            if isinstance(table, dict):
+                plain = table.get(description)
+                if not plain:
+                    for key, value in table.items():
+                        if isinstance(key, str) and key.lower() in description.lower():
+                            plain = value
+                            break
+                if plain:
+                    return f"{description}\n\n{plain}"
+    except Exception:
+        pass
+    return description
 def _is_transient_network_error(exc: BaseException) -> bool:
     """Return True for transient network errors safe to log + swallow.
 
@@ -9458,6 +9478,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return await self._handle_help_command(event)
                 if _cmd_def_inner.name == "commands":
                     return await self._handle_commands_command(event)
+                if _cmd_def_inner.name == "opportunity-router":
+                    return await self._handle_opportunity_router_command(event)
+                # Fall through to other dedicated handlers below.
                 if _cmd_def_inner.name == "profile":
                     return await self._handle_profile_command(event)
                 if _cmd_def_inner.name == "update":
@@ -9747,6 +9770,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "agents":
             return await self._handle_agents_command(event)
 
+        if canonical == "opportunity-router":
+            return await self._handle_opportunity_router_command(event)
+
         if canonical == "platform":
             return await self._handle_platform_command(event)
 
@@ -9882,6 +9908,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "usage":
             return await self._handle_usage_command(event)
+
+        if canonical == "usage-report":
+            return await self._handle_usage_report_command(event)
 
         if canonical == "credits":
             return await self._handle_credits_command(event)
@@ -18558,6 +18587,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # (send_exec_approval) and plain-text fallback paths below use
                 # the redacted value.
                 cmd = _redact_approval_command(cmd)
+                desc = _load_approval_translation(desc)
 
                 # Prefer button-based approval when the adapter supports it.
                 # Check the *class* for the method, not the instance — avoids

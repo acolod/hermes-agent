@@ -66,6 +66,46 @@ class TestSlashCommands:
         assert "/" in response_text
 
     @pytest.mark.asyncio
+    async def test_opportunity_router_without_prompt_shows_help(self, adapter, platform):
+        send = await send_and_capture(adapter, "/opportunity-router", platform)
+
+        send.assert_called_once()
+        response_text = send.call_args[1].get("content") or send.call_args[0][1]
+        lowered = response_text.lower()
+        assert "usage: /opportunity-router <prompt>" in lowered
+        assert "example: /opportunity-router" in lowered
+
+    @pytest.mark.asyncio
+    async def test_opportunity_router_command_acknowledges_and_relays(self, adapter, platform, monkeypatch):
+        from types import SimpleNamespace
+
+        import gateway.slash_commands as slash_commands
+
+        fake_outcome = SimpleNamespace(
+            final_response=(
+                "Verdict: pursue (high confidence)\n"
+                "Summary: The idea is plausible.\n"
+                "Next-best test: Talk to five buyers."
+            )
+        )
+        monkeypatch.setattr(slash_commands, "route_opportunity_request", lambda *args, **kwargs: fake_outcome)
+
+        send = await send_and_capture(
+            adapter,
+            "/opportunity-router Vet this idea: local venue workflow audits.",
+            platform,
+            thread_id="thread-1",
+        )
+
+        assert send.call_count == 2
+        first_kwargs = send.call_args_list[0].kwargs
+        first_text = first_kwargs.get("content") or send.call_args_list[0].args[1]
+        second_text = send.call_args_list[1].kwargs.get("content") or send.call_args_list[1].args[1]
+        assert "routing to opportunity-radar specialist" in first_text.lower()
+        assert first_kwargs.get("metadata") is not None
+        assert second_text == fake_outcome.final_response
+
+    @pytest.mark.asyncio
     async def test_sequential_commands_share_session(self, adapter, platform):
         """Two commands from the same chat_id should both succeed."""
         send_help = await send_and_capture(adapter, "/help", platform)

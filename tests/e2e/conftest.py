@@ -128,13 +128,14 @@ from plugins.platforms.slack.adapter import SlackAdapter  # noqa: E402
 
 # Platform-generic factories
 
-def make_source(platform: Platform, chat_id: str = "e2e-chat-1", user_id: str = "e2e-user-1", chat_type: str = "dm") -> SessionSource:
+def make_source(platform: Platform, chat_id: str = "e2e-chat-1", user_id: str = "e2e-user-1", chat_type: str = "dm", thread_id: str | None = None) -> SessionSource:
     return SessionSource(
         platform=platform,
         chat_id=chat_id,
         user_id=user_id,
         user_name="e2e_tester",
         chat_type=chat_type,
+        thread_id=thread_id,
     )
 
 
@@ -156,10 +157,11 @@ def make_event(
     chat_id: str = "e2e-chat-1",
     user_id: str = "e2e-user-1",
     chat_type: str = "dm",
+    thread_id: str | None = None,
 ) -> MessageEvent:
     return MessageEvent(
         text=text,
-        source=make_source(platform, chat_id, user_id, chat_type),
+        source=make_source(platform, chat_id, user_id, chat_type, thread_id=thread_id),
         message_id=f"msg-{uuid.uuid4().hex[:8]}",
     )
 

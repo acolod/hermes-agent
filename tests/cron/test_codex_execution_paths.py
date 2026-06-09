@@ -190,3 +190,17 @@ def test_gateway_run_agent_codex_path_handles_internal_401_refresh(monkeypatch):
     assert _Codex401ThenSuccessAgent.refresh_attempts == 1
     assert _Codex401ThenSuccessAgent.last_init["provider"] == "openai-codex"
     assert _Codex401ThenSuccessAgent.last_init["api_mode"] == "codex_responses"
+
+
+def test_approval_translation_uses_active_hermes_home(tmp_path, monkeypatch):
+    (tmp_path / "approval-translations.json").write_text(
+        '{"dangerous command": "Human-friendly warning", "rm -rf": "Delete everything"}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(gateway_run, "get_hermes_home", lambda: tmp_path)
+
+    translated = gateway_run._load_approval_translation("dangerous command")
+    assert translated == "dangerous command\n\nHuman-friendly warning"
+
+    translated_partial = gateway_run._load_approval_translation("please run rm -rf /tmp/test")
+    assert translated_partial == "please run rm -rf /tmp/test\n\nDelete everything"

@@ -27,10 +27,12 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Optional, Union
 
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.i18n import t
+from agent.opportunity_routing import OPPORTUNITY_RADAR_PROFILE, route_opportunity_request
 from gateway.config import HomeChannel, Platform, PlatformConfig
 from gateway.platforms.base import EphemeralReply, MessageEvent, MessageType
 from gateway.session import (
@@ -2634,6 +2636,60 @@ class GatewaySlashCommandsMixin:
 
         preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
         return t("gateway.background.started", preview=preview, task_id=task_id)
+
+    async def _handle_opportunity_router_command(self, event: MessageEvent) -> str:
+        """Handle /opportunity-router <prompt> — route a validation request to opportunity-radar.
+
+        This is the explicit gateway/Telegram fast path. It sends a short ack
+        before running the specialist so mobile users get immediate feedback,
+        then returns the specialist relay once the routed run completes.
+        """
+        prompt = event.get_command_args().strip()
+        if not prompt:
+            return (
+                "Usage: /opportunity-router <prompt>\n"
+                "Example: /opportunity-router Vet this idea: B2B workflow audits for local venues."
+            )
+
+        active_profile_fn = getattr(self, "_active_profile_name", None)
+        active_profile = active_profile_fn() if callable(active_profile_fn) else None
+        if active_profile == OPPORTUNITY_RADAR_PROFILE:
+            return (
+                "Opportunity-radar is already the active profile here. "
+                "Ask the prompt directly instead of routing it again."
+            )
+
+        source = event.source
+        adapters = getattr(self, "adapters", {})
+        adapter = adapters.get(source.platform) if hasattr(adapters, "get") else None
+        if adapter is not None:
+            await adapter.send(
+                source.chat_id,
+                "Routing to opportunity-radar specialist...",
+                metadata=self._thread_metadata_for_source(
+                    source, self._reply_anchor_for_event(event)
+                ),
+            )
+
+        session_key_fn = getattr(self, "_session_key_for_source", None)
+        session_id = session_key_fn(source) if callable(session_key_fn) else str(source.chat_id)
+        platform_value = getattr(source.platform, "value", source.platform)
+        source_platform = str(platform_value)
+        route_agent = SimpleNamespace(
+            platform=source_platform,
+            session_id=session_id,
+            chat_id=source.chat_id,
+            thread_id=getattr(source, "thread_id", None),
+            profile=active_profile,
+        )
+        outcome = await asyncio.to_thread(
+            route_opportunity_request,
+            route_agent,
+            user_message=prompt,
+            original_user_message=prompt,
+            source_platform=source_platform,
+        )
+        return outcome.final_response
 
     async def _handle_reasoning_command(self, event: MessageEvent) -> str:
         """Handle /reasoning command — manage reasoning effort and display toggle.
