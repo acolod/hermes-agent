@@ -4146,6 +4146,62 @@ class GatewaySlashCommandsMixin:
             return "\n".join(parts)
         return t("gateway.usage.no_data")
 
+    async def _handle_usage_report_command(self, event: MessageEvent) -> str:
+        """Handle /usage-report — summarize skill usage telemetry.
+
+        The command is gateway-only, so keep the response compact and mobile
+        friendly: total catalog size, provenance counts, and the most active
+        skills from the current telemetry snapshot. Run the filesystem scan off
+        the event loop because usage_report() walks the whole skills tree.
+        """
+        from tools.skill_usage import usage_report
+
+        rows = await asyncio.to_thread(usage_report)
+        if not rows:
+            return "📈 **Skill Usage Report**\nNo skills found in the current profile."
+
+        counts = {"agent": 0, "bundled": 0, "hub": 0}
+        active_rows = []
+        for row in rows:
+            prov = str(row.get("provenance") or "agent")
+            counts[prov] = counts.get(prov, 0) + 1
+            if int(row.get("activity_count") or 0) > 0:
+                active_rows.append(row)
+
+        ranked = sorted(
+            active_rows,
+            key=lambda row: (-int(row.get("activity_count") or 0), str(row.get("name") or "")),
+        )[:5]
+
+        lines = [
+            "📈 **Skill Usage Report**",
+            f"Skills tracked: {len(rows)} total · {len(active_rows)} active",
+            (
+                "Sources: "
+                f"local {counts.get('agent', 0)} · "
+                f"bundled {counts.get('bundled', 0)} · "
+                f"hub {counts.get('hub', 0)}"
+            ),
+        ]
+
+        if ranked:
+            lines.append("")
+            lines.append("Top active skills:")
+            for idx, row in enumerate(ranked, start=1):
+                name = str(row.get("name") or "(unnamed)")
+                uses = int(row.get("use_count") or 0)
+                views = int(row.get("view_count") or 0)
+                activity = int(row.get("activity_count") or 0)
+                prov = str(row.get("provenance") or "agent")
+                lines.append(
+                    f"{idx}. {name} — {activity} touches ({uses} uses, {views} views) [{prov}]"
+                )
+        else:
+            lines.append("")
+            lines.append("No recorded skill activity yet.")
+
+        return "\n".join(lines)
+
     async def _handle_insights_command(self, event: MessageEvent) -> str:
         """Handle /insights command -- show usage insights and analytics."""
         args = event.get_command_args().strip()

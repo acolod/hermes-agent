@@ -106,6 +106,40 @@ class TestSlashCommands:
         assert second_text == fake_outcome.final_response
 
     @pytest.mark.asyncio
+    async def test_usage_report_command_dispatches_to_gateway_handler(self, adapter, platform, monkeypatch):
+        import tools.skill_usage as skill_usage
+
+        monkeypatch.setattr(
+            skill_usage,
+            "usage_report",
+            lambda: [
+                {
+                    "name": "opportunity-radar",
+                    "provenance": "agent",
+                    "activity_count": 4,
+                    "use_count": 3,
+                    "view_count": 1,
+                },
+                {
+                    "name": "hermes-agent",
+                    "provenance": "bundled",
+                    "activity_count": 0,
+                    "use_count": 0,
+                    "view_count": 0,
+                },
+            ],
+        )
+
+        send = await send_and_capture(adapter, "/usage-report", platform)
+
+        send.assert_called_once()
+        response_text = send.call_args[1].get("content") or send.call_args[0][1]
+        assert "skill usage report" in response_text.lower()
+        assert "skills tracked: 2 total" in response_text.lower()
+        assert "top active skills" in response_text.lower()
+        assert "1. opportunity-radar" in response_text.lower()
+
+    @pytest.mark.asyncio
     async def test_sequential_commands_share_session(self, adapter, platform):
         """Two commands from the same chat_id should both succeed."""
         send_help = await send_and_capture(adapter, "/help", platform)
