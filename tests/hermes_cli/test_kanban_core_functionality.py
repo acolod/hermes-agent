@@ -2155,6 +2155,29 @@ def test_block_never_claimed_task_synthesizes_run(kanban_home):
         conn.close()
 
 
+def test_block_never_claimed_metadata_only_gets_default_reason(kanban_home):
+    """Direct block_task(metadata=...) should not synthesize a reasonless blocked run."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="metadata only", assignee="worker")
+        ok = kb.block_task(conn, tid, metadata={"source": "operator"})
+        assert ok is True
+
+        runs = kb.list_runs(conn, tid)
+        assert len(runs) == 1
+        r = runs[0]
+        assert r.outcome == "blocked"
+        assert r.summary == "blocked"
+        assert r.metadata == {"source": "operator"}
+
+        evts = [e for e in kb.list_events(conn, tid) if e.kind == "blocked"]
+        assert len(evts) == 1
+        assert evts[0].payload["reason"] == "blocked"
+        assert evts[0].run_id == r.id
+    finally:
+        conn.close()
+
+
 def test_complete_never_claimed_without_handoff_skips_synthesis(kanban_home):
     """If a bulk-complete passes no summary/metadata/result, don't spam
     the runs table with empty synthetic rows."""

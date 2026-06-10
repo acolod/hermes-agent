@@ -173,6 +173,10 @@ def _validate_blocker_classification(value: Any) -> tuple[Optional[dict], Option
         return None, None
     if not isinstance(value, dict):
         return None, "classification must be an object/dict"
+    if not value:
+        # Treat an empty object like the field being omitted so callers do not
+        # get a silent ok:true + dropped metadata mismatch.
+        return None, None
 
     errors: list[str] = []
     classification = dict(value)

@@ -4578,9 +4578,12 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    block_reason = reason if reason and str(reason).strip() else None
+    if block_reason is None and metadata is not None:
+        block_reason = "blocked"
 
     def _event_payload(**extra: Any) -> dict:
-        payload = {"reason": reason, **extra}
+        payload = {"reason": block_reason, **extra}
         if isinstance(metadata, dict) and metadata.get("blocker_classification"):
             payload["classification"] = metadata["blocker_classification"]
         return payload
@@ -4626,14 +4629,14 @@ def block_task(
             run_id = _end_run(
                 conn, task_id,
                 outcome="blocked", status="blocked",
-                summary=reason,
+                summary=block_reason,
                 metadata=metadata,
             )
-            if run_id is None and (reason or metadata):
+            if run_id is None and (block_reason or metadata):
                 run_id = _synthesize_ended_run(
                     conn, task_id,
                     outcome="blocked",
-                    summary=reason,
+                    summary=block_reason,
                     metadata=metadata,
                 )
             _append_event(
@@ -4648,7 +4651,7 @@ def block_task(
                 board=get_current_board(),
                 assignee=_blocked_task.assignee if _blocked_task else None,
                 run_id=run_id,
-                reason=reason,
+                reason=block_reason,
             )
             return True
 
@@ -4684,14 +4687,14 @@ def block_task(
             run_id = _end_run(
                 conn, task_id,
                 outcome="blocked", status="blocked",
-                summary=reason,
+                summary=block_reason,
                 metadata=metadata,
             )
-            if run_id is None and (reason or metadata):
+            if run_id is None and (block_reason or metadata):
                 run_id = _synthesize_ended_run(
                     conn, task_id,
                     outcome="blocked",
-                    summary=reason,
+                    summary=block_reason,
                     metadata=metadata,
                 )
             _append_event(
@@ -4741,16 +4744,16 @@ def block_task(
             run_id = _end_run(
                 conn, task_id,
                 outcome="blocked", status="blocked",
-                summary=reason,
+                summary=block_reason,
                 metadata=metadata,
             )
             # Synthesize a run when blocking a never-claimed task so the
             # reason is preserved in attempt history.
-            if run_id is None and (reason or metadata):
+            if run_id is None and (block_reason or metadata):
                 run_id = _synthesize_ended_run(
                     conn, task_id,
                     outcome="blocked",
-                    summary=reason,
+                    summary=block_reason,
                     metadata=metadata,
                 )
             _append_event(
@@ -4765,11 +4768,9 @@ def block_task(
         board=get_current_board(),
         assignee=_blocked_task.assignee if _blocked_task else None,
         run_id=run_id,
-        reason=reason,
+        reason=block_reason,
     )
     return True
-
-
 
 def promote_task(
     conn: sqlite3.Connection,

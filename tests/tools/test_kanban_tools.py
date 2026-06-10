@@ -824,6 +824,29 @@ def test_block_rejects_invalid_classification(worker_env):
     assert "classification.evidence must be a string" in err
 
 
+def test_block_treats_empty_classification_as_omitted(worker_env):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    out = kt._handle_block({
+        "reason": "review finding disproved",
+        "classification": {},
+    })
+    assert json.loads(out)["ok"] is True
+
+    conn = kb.connect()
+    try:
+        events = kb.list_events(conn, worker_env)
+        blocked = [event for event in events if event.kind == "blocked"][-1]
+        assert blocked.payload is not None
+        assert "classification" not in blocked.payload
+        run = kb.latest_run(conn, worker_env)
+        assert run is not None
+        assert run.metadata is None
+    finally:
+        conn.close()
+
+
 def test_block_rejects_empty_reason(worker_env):
     from tools import kanban_tools as kt
     for bad in ["", "   ", None]:
@@ -1585,7 +1608,11 @@ def test_kanban_guidance_in_worker_prompt(monkeypatch, tmp_path):
     assert "kanban_block" in prompt
     assert "kanban_create" in prompt
     # Anti-shell guidance
-    assert "Do not shell out" in prompt or "tools — they work" in prompt
+    assert "Do not shell out to `hermes kanban <verb>`" in prompt
+    # Review-finding safety
+    assert "proof-check" in prompt
+    assert "live tree" in prompt
+    assert "stale or disproven" in prompt
 
 
 def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
