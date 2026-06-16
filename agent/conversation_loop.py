@@ -57,7 +57,6 @@ from agent.model_metadata import (
     save_context_length,
 )
 from agent.process_bootstrap import _install_safe_stdio
-from agent.opportunity_routing import maybe_route_opportunity_request
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.retry_utils import (
     adaptive_rate_limit_backoff,
@@ -602,40 +601,6 @@ def run_conversation(
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
-
-    # Phase 1 opportunity routing: keep loose brainstorming local, but route
-    # validation-style opportunity requests to the specialist profile before
-    # the main model loop starts.
-    _opportunity_route = maybe_route_opportunity_request(
-        agent,
-        user_message=user_message,
-        original_user_message=original_user_message,
-        source_platform=getattr(agent, "platform", None),
-    )
-    if _opportunity_route is not None:
-        messages.append({"role": "assistant", "content": _opportunity_route.final_response})
-        final_response = _opportunity_route.final_response
-        failed = not _opportunity_route.success
-        interrupted = False
-        api_call_count = 0
-        _turn_exit_reason = _opportunity_route.turn_exit_reason
-        from agent.turn_finalizer import finalize_turn
-
-        return finalize_turn(
-            agent,
-            final_response=final_response,
-            api_call_count=api_call_count,
-            interrupted=interrupted,
-            failed=failed,
-            messages=messages,
-            conversation_history=conversation_history,
-            effective_task_id=effective_task_id,
-            turn_id=turn_id,
-            user_message=user_message,
-            original_user_message=original_user_message,
-            _should_review_memory=_should_review_memory,
-            _turn_exit_reason=_turn_exit_reason,
-        )
 
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0

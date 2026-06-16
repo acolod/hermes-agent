@@ -421,29 +421,21 @@ def test_busy_guard_returns_clear_message(monkeypatch):
     assert outcome.turn_exit_reason == "opportunity_route_busy"
 
 
-def test_run_conversation_short_circuits_on_route(monkeypatch):
-    agent = _make_agent()
-    outcome = routing.OpportunityRoutingOutcome(
-        routed=True,
-        success=True,
-        final_response="Verdict: pursue (high confidence)\nSummary: The concept is promising.\nNext-best test: Talk to 5 buyers.",
-        mode="single_idea_vetting",
-        turn_exit_reason="opportunity_route_success",
-        payload="{}",
-        command=("hermes", "-p", "opportunity-radar", "chat", "-q", "{}"),
-        attempts=1,
-        raw_output=_specialist_json(),
-        data=json.loads(_specialist_json()),
-    )
-
-    monkeypatch.setattr(
-        "agent.conversation_loop.maybe_route_opportunity_request",
-        lambda *args, **kwargs: outcome,
+def test_run_conversation_no_longer_short_circuits_on_validation_prompt():
+    agent = _make_agent(max_iterations=1)
+    agent.client.chat.completions.create.return_value = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content="Keeping this local.", tool_calls=[]),
+                finish_reason="stop",
+            )
+        ],
+        usage=None,
     )
 
     result = agent.run_conversation("Vet this idea: local venue workflow audits.")
 
-    assert result["final_response"] == outcome.final_response
-    assert result["api_calls"] == 0
+    assert result["final_response"] == "Keeping this local."
+    assert result["api_calls"] == 1
     assert result["failed"] is False
-    assert agent.client.chat.completions.create.call_count == 0
+    assert agent.client.chat.completions.create.call_count == 1
