@@ -1749,6 +1749,48 @@ class CLICommandsMixin:
         self._background_tasks[task_id] = thread
         thread.start()
 
+    def _handle_opportunity_router_command(self, cmd: str):
+        """Handle /opportunity-router <prompt> in the interactive CLI."""
+        from types import SimpleNamespace
+
+        from agent.opportunity_routing import (
+            OPPORTUNITY_RADAR_PROFILE,
+            route_opportunity_request,
+        )
+        from cli import _cprint
+
+        parts = cmd.strip().split(maxsplit=1)
+        prompt = parts[1].strip() if len(parts) > 1 else ""
+        if not prompt:
+            _cprint("  Usage: /opportunity-router <prompt>")
+            _cprint("  Example: /opportunity-router Vet this idea: B2B workflow audits for local venues.")
+            return
+
+        active_profile = getattr(self, "profile", None)
+        if active_profile == OPPORTUNITY_RADAR_PROFILE:
+            _cprint(
+                "  Opportunity-radar is already the active profile here. "
+                "Ask the prompt directly instead of routing it again."
+            )
+            return
+
+        _cprint("  Routing to opportunity-radar specialist...")
+        route_agent = SimpleNamespace(
+            platform="cli",
+            session_id=getattr(self, "session_id", "cli-opportunity-router"),
+            chat_id=None,
+            thread_id=None,
+            profile=active_profile,
+        )
+        outcome = route_opportunity_request(
+            route_agent,
+            user_message=prompt,
+            original_user_message=prompt,
+            source_platform="cli",
+        )
+        if outcome.final_response:
+            print(outcome.final_response)
+
     def _handle_bundles_command(self, cmd: str) -> None:
         """In-session ``/bundles`` — show installed skill bundles.
 

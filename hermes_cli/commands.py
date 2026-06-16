@@ -108,7 +108,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
                args_hint="[list|delete <id>|edit <id>]",
                subcommands=("list", "delete", "edit")),
     CommandDef("opportunity-router", "Route a prompt to the opportunity-radar specialist for validation", "Tools & Skills",
-               gateway_only=True, args_hint="<prompt>"),
+               args_hint="<prompt>"),
     CommandDef("queue", "Queue a prompt for the next turn (doesn't interrupt)", "Session",
                aliases=("q",), args_hint="<prompt>"),
     CommandDef("steer", "Inject a message after the next tool call without interrupting", "Session",
