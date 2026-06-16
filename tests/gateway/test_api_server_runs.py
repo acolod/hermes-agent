@@ -19,6 +19,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
+    _normalize_chat_content,
     cors_middleware,
     security_headers_middleware,
 )
@@ -82,6 +83,17 @@ def _make_slow_agent(**kwargs):
     mock_agent.session_total_tokens = 0
 
     return mock_agent, ready, interrupted
+
+
+def test_normalize_chat_content_strips_tool_use_repr():
+    raw = (
+        "[{'type': 'text', 'text': 'Hello'}, "
+        "{'type': 'tool_use', 'id': 'tool_1', 'name': 'web_search', 'input': {'query': 'x'}}]"
+    )
+    assert _normalize_chat_content(raw) == "Hello"
+    assert _normalize_chat_content(
+        "[{'type': 'tool_use', 'id': 'tool_2', 'name': 'web_search', 'input': {'query': 'x'}}]"
+    ) == ""
 
 
 @pytest.fixture
@@ -227,6 +239,37 @@ class TestRunStatus:
                 assert status["last_event"] == "run.completed"
 
     @pytest.mark.asyncio
+    async def test_status_completed_run_normalizes_raw_content_block_repr(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {
+                    "final_response": "[SimpleNamespace(type='output_text', text='Visible answer', annotations=[])]"
+                }
+                mock_agent.session_prompt_tokens = 1
+                mock_agent.session_completion_tokens = 1
+                mock_agent.session_total_tokens = 2
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                data = await resp.json()
+                run_id = data["run_id"]
+
+                status = {}
+                for _ in range(20):
+                    status_resp = await cli.get(f"/v1/runs/{run_id}")
+                    assert status_resp.status == 200
+                    status = await status_resp.json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+                assert status["status"] == "completed"
+                assert status["output"] == "Visible answer"
+                assert "SimpleNamespace" not in status["output"]
+
+    @pytest.mark.asyncio
     async def test_status_reflects_explicit_session_id(self, adapter):
         app = _create_runs_app(adapter)
         async with TestClient(TestServer(app)) as cli:
@@ -304,6 +347,33 @@ class TestRunEvents:
                 # Should contain run.completed
                 assert "run.completed" in body
                 assert "Hello!" in body
+
+    @pytest.mark.asyncio
+    async def test_events_stream_normalizes_raw_content_block_repr(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {
+                    "final_response": "[SimpleNamespace(type='output_text', text='Visible answer', annotations=[])]"
+                }
+                mock_agent.session_prompt_tokens = 1
+                mock_agent.session_completion_tokens = 1
+                mock_agent.session_total_tokens = 2
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                assert resp.status == 202
+                data = await resp.json()
+                run_id = data["run_id"]
+
+                events_resp = await cli.get(f"/v1/runs/{run_id}/events")
+                assert events_resp.status == 200
+                body = await events_resp.text()
+
+                assert "run.completed" in body
+                assert "Visible answer" in body
+                assert "SimpleNamespace" not in body
 
 
 

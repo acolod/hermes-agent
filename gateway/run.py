@@ -1756,6 +1756,7 @@ from gateway.session import (
 from gateway.delivery import DeliveryRouter, looks_like_telegram_private_chat_id
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
+from gateway.response_normalization import normalize_visible_text
 from gateway.slash_commands import GatewaySlashCommandsMixin
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -10287,9 +10288,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             try:
                 _final_text = ""
                 if isinstance(_agent_result, dict):
-                    _final_text = str(_agent_result.get("final_response") or "")
+                    _final_text = normalize_visible_text(_agent_result.get("final_response") or "")
                 elif isinstance(_agent_result, str):
-                    _final_text = _agent_result
+                    _final_text = normalize_visible_text(_agent_result)
                 # Skip for empty responses (interrupted / errored) — the
                 # judge would almost always say "continue" and we'd loop
                 # on error. Let the user drive the next turn.
@@ -11602,7 +11603,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _stale_adapter._post_delivery_callbacks.pop(_quick_key, None)
                 return None
 
-            response = agent_result.get("final_response") or ""
+            response = normalize_visible_text(agent_result.get("final_response") or "")
             try:
                 from gateway.response_filters import is_intentional_silence_agent_result
                 _intentional_silence = is_intentional_silence_agent_result(
@@ -13374,7 +13375,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             result = await self._run_in_executor_with_context(run_sync)
 
-            response = result.get("final_response", "") if result else ""
+            response = normalize_visible_text(result.get("final_response", "")) if isinstance(result, dict) else ""
             if not response and result and result.get("error"):
                 response = f"Error: {result['error']}"
 
@@ -18855,7 +18856,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _stream_consumer.finish()
             
             # Return final response, or a message if something went wrong
-            final_response = result.get("final_response")
+            final_response = normalize_visible_text(result.get("final_response"))
 
             # Extract actual token counts from the agent instance used for this run
             _last_prompt_toks = 0
@@ -19759,7 +19760,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         except Exception as e:
                             logger.debug("Stream consumer wait before queued message failed: %s", e)
                     _previewed = bool(result.get("response_previewed"))
-                    first_response = result.get("final_response", "")
+                    first_response = normalize_visible_text(result.get("final_response", "")) if isinstance(result, dict) else ""
                     _already_streamed = _stream_confirmed_final_delivery(
                         _sc,
                         first_response,
@@ -20009,7 +20010,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         await _sc.adapter.edit_message(
                             chat_id=source.chat_id,
                             message_id=_sc_msg_id,
-                            content=response["final_response"],
+                            content=normalize_visible_text(response.get("final_response") or ""),
                             finalize=True,
                         )
                         response["already_sent"] = True

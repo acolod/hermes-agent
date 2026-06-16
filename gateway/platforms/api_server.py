@@ -61,6 +61,7 @@ from gateway.platforms.base import (
     validate_media_delivery_path,
 )
 from agent.redact import redact_sensitive_text
+from gateway.response_normalization import normalize_visible_text
 
 logger = logging.getLogger(__name__)
 
@@ -137,65 +138,8 @@ def _coerce_request_bool(value: Any, default: bool = False) -> bool:
 def _normalize_chat_content(
     content: Any, *, _max_depth: int = 10, _depth: int = 0,
 ) -> str:
-    """Normalize OpenAI chat message content into a plain text string.
-
-    Some clients (Open WebUI, LobeChat, etc.) send content as an array of
-    typed parts instead of a plain string::
-
-        [{"type": "text", "text": "hello"}, {"type": "input_text", "text": "..."}]
-
-    This function flattens those into a single string so the agent pipeline
-    (which expects strings) doesn't choke.
-
-    Defensive limits prevent abuse: recursion depth, list size, and output
-    length are all bounded.
-    """
-    if _depth > _max_depth:
-        return ""
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content[:MAX_NORMALIZED_TEXT_LENGTH] if len(content) > MAX_NORMALIZED_TEXT_LENGTH else content
-
-    if isinstance(content, list):
-        parts: List[str] = []
-        total_len = 0
-        items = content[:MAX_CONTENT_LIST_SIZE] if len(content) > MAX_CONTENT_LIST_SIZE else content
-        for item in items:
-            if isinstance(item, str):
-                if item:
-                    part = item[:MAX_NORMALIZED_TEXT_LENGTH]
-                    parts.append(part)
-                    total_len += len(part)
-            elif isinstance(item, dict):
-                item_type = str(item.get("type") or "").strip().lower()
-                if item_type in {"text", "input_text", "output_text"}:
-                    text = item.get("text", "")
-                    if text:
-                        try:
-                            part = str(text)[:MAX_NORMALIZED_TEXT_LENGTH]
-                            parts.append(part)
-                            total_len += len(part)
-                        except Exception:
-                            pass
-                # Silently skip image_url / other non-text parts
-            elif isinstance(item, list):
-                nested = _normalize_chat_content(item, _max_depth=_max_depth, _depth=_depth + 1)
-                if nested:
-                    parts.append(nested)
-                    total_len += len(nested)
-            # Check accumulated size
-            if total_len >= MAX_NORMALIZED_TEXT_LENGTH:
-                break
-        result = "\n".join(parts)
-        return result[:MAX_NORMALIZED_TEXT_LENGTH] if len(result) > MAX_NORMALIZED_TEXT_LENGTH else result
-
-    # Fallback for unexpected types (int, float, bool, etc.)
-    try:
-        result = str(content)
-        return result[:MAX_NORMALIZED_TEXT_LENGTH] if len(result) > MAX_NORMALIZED_TEXT_LENGTH else result
-    except Exception:
-        return ""
+    """Normalize user-facing content into visible plain text only."""
+    return normalize_visible_text(content, _max_depth=_max_depth, _depth=_depth)
 
 
 # Content part type aliases used by the OpenAI Chat Completions and Responses
@@ -1660,7 +1604,14 @@ class APIServerAdapter(BasePlatformAdapter):
             "tool_name", "timestamp", "token_count", "finish_reason", "reasoning",
             "reasoning_content",
         )
-        return {key: message.get(key) for key in safe_keys if key in message}
+        safe = {key: message.get(key) for key in safe_keys if key in message}
+        if "content" in safe:
+            safe["content"] = _normalize_chat_content(safe.get("content"))
+        if "reasoning" in safe:
+            safe["reasoning"] = _normalize_chat_content(safe.get("reasoning"))
+        if "reasoning_content" in safe:
+            safe["reasoning_content"] = _normalize_chat_content(safe.get("reasoning_content"))
+        return safe
 
     async def _read_json_body(self, request: "web.Request") -> tuple[Dict[str, Any], Optional["web.Response"]]:
         try:
@@ -1903,7 +1854,9 @@ class APIServerAdapter(BasePlatformAdapter):
             gateway_session_key=gateway_session_key,
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
-        final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
+        final_response = _resolve_media_to_data_urls(
+            _normalize_chat_content(result.get("final_response", "")) if isinstance(result, dict) else ""
+        )
         headers = {"X-Hermes-Session-Id": effective_session_id or session_id}
         if gateway_session_key:
             headers["X-Hermes-Session-Key"] = gateway_session_key
@@ -1993,7 +1946,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     tool_progress_callback=_tool_progress,
                     gateway_session_key=gateway_session_key,
                 )
-                final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
+                final_response = _resolve_media_to_data_urls(
+                    _normalize_chat_content(result.get("final_response", "")) if isinstance(result, dict) else ""
+                )
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
                 turn_messages = self._turn_transcript_messages(history, user_message, result) if isinstance(result, dict) else []
                 await queue.put(_event_payload("assistant.completed", {
@@ -2322,7 +2277,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=500,
                 )
 
-        final_response = _resolve_media_to_data_urls(result.get("final_response") or "")
+        final_response = _resolve_media_to_data_urls(
+            _normalize_chat_content(result.get("final_response") or "")
+        )
         is_partial = bool(result.get("partial"))
         is_failed = bool(result.get("failed"))
         completed = bool(result.get("completed", True))
@@ -2794,14 +2751,17 @@ class APIServerAdapter(BasePlatformAdapter):
                 })
 
             async def _emit_text_delta(delta_text: str) -> None:
+                normalized_text = _normalize_chat_content(delta_text)
+                if not normalized_text:
+                    return
                 await _open_message_item()
-                final_text_parts.append(delta_text)
+                final_text_parts.append(normalized_text)
                 await _write_event("response.output_text.delta", {
                     "type": "response.output_text.delta",
                     "item_id": message_item_id,
                     "output_index": message_output_index,
                     "content_index": 0,
-                    "delta": delta_text,
+                    "delta": normalized_text,
                     "logprobs": [],
                 })
 
@@ -3010,7 +2970,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 # deltas were streamed (e.g. some providers only emit
                 # the full response at the end), emit a single fallback
                 # delta so Responses clients still receive a live text part.
-                agent_final = result.get("final_response", "") if isinstance(result, dict) else ""
+                agent_final = _normalize_chat_content(result.get("final_response", "")) if isinstance(result, dict) else ""
                 if agent_final and not final_text_parts:
                     await _emit_text_delta(agent_final)
                 if agent_final and not final_response_text:
@@ -3426,7 +3386,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=500,
                 )
 
-        final_response = _resolve_media_to_data_urls(result.get("final_response", ""))
+        final_response = _resolve_media_to_data_urls(
+            _normalize_chat_content(result.get("final_response", ""))
+        )
         if not final_response:
             final_response = _redact_api_error_text(result.get("error", "(No response generated)"))
 
@@ -3941,7 +3903,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 })
 
         # Final assistant message
-        final = result.get("final_response", "")
+        final = _normalize_chat_content(result.get("final_response", ""))
         if not final:
             final = _redact_api_error_text(result.get("error", "(No response generated)"))
 
@@ -4262,14 +4224,15 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Also wire stream_delta_callback so message.delta events flow through.
         def _text_cb(delta: Optional[str]) -> None:
-            if delta is None:
+            delta_text = _normalize_chat_content(delta)
+            if not delta_text:
                 return
             try:
                 loop.call_soon_threadsafe(q.put_nowait, {
                     "event": "message.delta",
                     "run_id": run_id,
                     "timestamp": time.time(),
-                    "delta": delta,
+                    "delta": delta_text,
                 })
             except Exception:
                 pass
@@ -4390,7 +4353,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         last_event="run.failed",
                     )
                 else:
-                    final_response = result.get("final_response", "") if isinstance(result, dict) else ""
+                    final_response = _normalize_chat_content(result.get("final_response", "")) if isinstance(result, dict) else ""
                     q.put_nowait({
                         "event": "run.completed",
                         "run_id": run_id,

@@ -1031,7 +1031,7 @@ class TransformedStreamAgent:
         if self.stream_delta_callback:
             self.stream_delta_callback("original answer")
         return {
-            "final_response": "original answer\n\n[plugin appended this]",
+            "final_response": "[SimpleNamespace(type='output_text', text='Visible answer', annotations=[])]",
             "response_previewed": True,
             "response_transformed": True,
             "messages": [],
@@ -1064,12 +1064,11 @@ async def test_transformed_response_edits_streamed_message_in_place(monkeypatch,
 
     # Final delivery happened (no duplicate send fallback).
     assert result.get("already_sent") is True
-    # The transformed final text reached the user — appended portion is present
-    # in an edit_message call (not just in the streamed sends).
+    # The transformed final text reached the user as normalized prose rather
+    # than a raw content-block repr.
     edited_texts = [e["content"] for e in adapter.edits]
-    assert any("[plugin appended this]" in text for text in edited_texts), (
-        f"expected transformed text in adapter.edits, got: {edited_texts!r}"
-    )
+    assert "Visible answer" in edited_texts, edited_texts
+    assert all("SimpleNamespace(" not in text for text in edited_texts), edited_texts
 
 
 @pytest.mark.asyncio
