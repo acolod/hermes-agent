@@ -808,6 +808,20 @@ class TestUpdateCheckEndpoint:
         import hermes_cli.banner as banner
 
         monkeypatch.setattr(banner, "check_for_updates", lambda: 5)
+        monkeypatch.setattr(
+            ws,
+            "_git_update_applyability",
+            lambda target_branch="main": {
+                "can_apply": True,
+                "branch": "main",
+                "target_branch": target_branch,
+                "ahead": 0,
+                "dirty": False,
+                "dirty_entries": 0,
+                "reason": None,
+                "message": None,
+            },
+        )
 
         r = self.client.get("/api/hermes/update/check")
         assert r.status_code == 200
@@ -824,10 +838,10 @@ class TestUpdateCheckEndpoint:
         assert body["install_method"] == "git"
         assert body["behind"] == 5
         assert body["update_available"] is True
-        # git/pip installs can apply the update in place from the dashboard.
+        # git installs are applyable when the checkout is clean and fast-forwardable.
         assert body["can_apply"] is True
+        assert body["update_command"] == "hermes update"
 
-    def test_up_to_date(self, monkeypatch):
         import hermes_cli.web_server as ws
         import hermes_cli.banner as banner
 
@@ -898,6 +912,20 @@ class TestUpdateCheckEndpoint:
                 {"sha": "abc1234", "summary": "feat: x", "author": "a", "at": 1},
             ],
         )
+        monkeypatch.setattr(
+            ws,
+            "_git_update_applyability",
+            lambda target_branch="main": {
+                "can_apply": True,
+                "branch": "main",
+                "target_branch": target_branch,
+                "ahead": 0,
+                "dirty": False,
+                "dirty_entries": 0,
+                "reason": None,
+                "message": None,
+            },
+        )
 
         body = self.client.get("/api/hermes/update/check").json()
         # The desktop overlay renders this as the "what's changed" list.
@@ -905,12 +933,58 @@ class TestUpdateCheckEndpoint:
         assert body["commits"][0]["sha"] == "abc1234"
         assert body["commits"][0]["summary"] == "feat: x"
 
+    def test_git_check_blocks_dashboard_apply_when_local_commits_exist(self, monkeypatch):
+        import hermes_cli.web_server as ws
+        import hermes_cli.banner as banner
+
+        monkeypatch.setattr(ws, "detect_install_method", lambda *a, **k: "git")
+        monkeypatch.setattr(banner, "check_for_updates", lambda: 5)
+        monkeypatch.setattr(
+            ws,
+            "_git_update_applyability",
+            lambda target_branch="main": {
+                "can_apply": False,
+                "branch": "local/live",
+                "target_branch": target_branch,
+                "ahead": 5,
+                "dirty": True,
+                "dirty_entries": 3,
+                "reason": "local_commits",
+                "message": "local repo diverged",
+            },
+        )
+
+        body = self.client.get("/api/hermes/update/check").json()
+        assert body["behind"] == 5
+        assert body["update_available"] is True
+        assert body["can_apply"] is False
+        assert body["branch"] == "local/live"
+        assert body["local_ahead"] == 5
+        assert body["dirty_worktree"] is True
+        assert body["dirty_entries"] == 3
+        assert body["apply_block_reason"] == "local_commits"
+        assert body["message"] == "local repo diverged"
+
     def test_up_to_date_omits_commits(self, monkeypatch):
         import hermes_cli.web_server as ws
         import hermes_cli.banner as banner
 
         monkeypatch.setattr(ws, "detect_install_method", lambda *a, **k: "git")
         monkeypatch.setattr(banner, "check_for_updates", lambda: 0)
+        monkeypatch.setattr(
+            ws,
+            "_git_update_applyability",
+            lambda target_branch="main": {
+                "can_apply": True,
+                "branch": "main",
+                "target_branch": target_branch,
+                "ahead": 0,
+                "dirty": False,
+                "dirty_entries": 0,
+                "reason": None,
+                "message": None,
+            },
+        )
 
         body = self.client.get("/api/hermes/update/check").json()
         # No commits list when there's nothing to show (additive, non-breaking).

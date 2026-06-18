@@ -1760,6 +1760,20 @@ class TestWebServerEndpoints:
             return Proc()
 
         monkeypatch.setattr(web_server, "detect_install_method", lambda _root: "git")
+        monkeypatch.setattr(
+            web_server,
+            "_git_update_applyability",
+            lambda target_branch="main": {
+                "can_apply": True,
+                "branch": "main",
+                "target_branch": target_branch,
+                "ahead": 0,
+                "dirty": False,
+                "dirty_entries": 0,
+                "reason": None,
+                "message": None,
+            },
+        )
         monkeypatch.setattr(web_server, "_spawn_hermes_action", fake_spawn)
         web_server._ACTION_PROCS.pop("hermes-update", None)
         web_server._ACTION_RESULTS.pop("hermes-update", None)
@@ -1769,6 +1783,54 @@ class TestWebServerEndpoints:
         assert resp.status_code == 200
         assert resp.json() == {"ok": True, "pid": 12345, "name": "hermes-update"}
         assert calls == [(["update"], "hermes-update")]
+
+    def test_update_hermes_blocks_diverged_git_checkout_without_spawning(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        spawned = False
+
+        def fail_spawn(*_args, **_kwargs):
+            nonlocal spawned
+            spawned = True
+            raise AssertionError("diverged git update guard should not spawn hermes update")
+
+        monkeypatch.setattr(web_server, "detect_install_method", lambda _root: "git")
+        monkeypatch.setattr(
+            web_server,
+            "_git_update_applyability",
+            lambda target_branch="main": {
+                "can_apply": False,
+                "branch": "local/live",
+                "target_branch": target_branch,
+                "ahead": 5,
+                "dirty": True,
+                "dirty_entries": 3,
+                "reason": "local_commits",
+                "message": "local repo diverged",
+            },
+        )
+        monkeypatch.setattr(web_server, "_spawn_hermes_action", fail_spawn)
+        web_server._ACTION_PROCS.pop("hermes-update", None)
+        web_server._ACTION_RESULTS.pop("hermes-update", None)
+
+        resp = self.client.post("/api/hermes/update")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is False
+        assert data["name"] == "hermes-update"
+        assert data["pid"] is None
+        assert data["error"] == "git_update_not_applyable"
+        assert data["message"] == "local repo diverged"
+        assert spawned is False
+
+        status = self.client.get("/api/actions/hermes-update/status")
+        assert status.status_code == 200
+        status_data = status.json()
+        assert status_data["running"] is False
+        assert status_data["exit_code"] == 1
+        assert status_data["pid"] is None
+        assert any("local repo diverged" in line for line in status_data["lines"])
 
     def test_action_status_reaps_completed_process(self, monkeypatch):
         import hermes_cli.web_server as web_server

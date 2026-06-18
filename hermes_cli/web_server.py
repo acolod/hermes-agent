@@ -3496,6 +3496,22 @@ async def update_hermes():
             "update_command": recommended_update_command_for_method(install_method),
         }
 
+    if install_method == "git":
+        applyability = _git_update_applyability()
+        if not applyability.get("can_apply", True):
+            message = applyability.get("message") or (
+                "This Hermes checkout is not safe to update in place from the dashboard."
+            )
+            _record_completed_action("hermes-update", message, exit_code=1)
+            return {
+                "ok": False,
+                "pid": None,
+                "name": "hermes-update",
+                "error": "git_update_not_applyable",
+                "message": message,
+                "update_command": "git fetch origin && git reset --hard origin/main",
+            }
+
     try:
         proc = _spawn_hermes_action(["update"], "hermes-update")
     except Exception as exc:
@@ -3556,6 +3572,73 @@ def _recent_upstream_commits(n: int = 20) -> List[Dict[str, Any]]:
         return []
 
 
+def _git_update_applyability(target_branch: str = "main") -> Dict[str, Any]:
+    """Best-effort preflight for dashboard-triggered git updates.
+
+    A local live lane with carried commits is valid, but the dashboard should
+    not advertise an in-place update path that can only fail later.
+    """
+    payload: Dict[str, Any] = {
+        "can_apply": True,
+        "branch": None,
+        "target_branch": target_branch,
+        "ahead": 0,
+        "dirty": False,
+        "dirty_entries": 0,
+        "reason": None,
+        "message": None,
+    }
+
+    try:
+        branch_result = subprocess.run(
+            ["git", "-C", str(PROJECT_ROOT), "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if branch_result.returncode == 0:
+            payload["branch"] = (branch_result.stdout or "").strip() or None
+
+        ahead_result = subprocess.run(
+            ["git", "-C", str(PROJECT_ROOT), "rev-list", "--count", f"origin/{target_branch}..HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if ahead_result.returncode == 0:
+            payload["ahead"] = int((ahead_result.stdout or "0").strip() or "0")
+
+        status_result = subprocess.run(
+            ["git", "-C", str(PROJECT_ROOT), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if status_result.returncode == 0:
+            dirty_entries = len([line for line in (status_result.stdout or "").splitlines() if line.strip()])
+            payload["dirty_entries"] = dirty_entries
+            payload["dirty"] = dirty_entries > 0
+
+        if payload["ahead"] > 0:
+            payload["can_apply"] = False
+            payload["reason"] = "local_commits"
+            payload["message"] = (
+                "The local agent repo has commits that are not on the remote "
+                f"branch origin/{target_branch}, so a fast-forward update is not "
+                "possible from the dashboard. "
+                + (
+                    "Local agent modifications are also present in the working tree; "
+                    "save or stash them before running destructive recovery commands."
+                    if payload["dirty"]
+                    else "Preserve or publish those local commits before updating."
+                )
+            )
+    except Exception:
+        return payload
+
+    return payload
+
+
 @app.get("/api/hermes/update/check")
 async def check_hermes_update(force: bool = False):
     """Report whether a Hermes update is available, without applying it.
@@ -3609,6 +3692,18 @@ async def check_hermes_update(force: bool = False):
         "message": None,
     }
 
+    if install_method == "git":
+        applyability = await asyncio.to_thread(_git_update_applyability)
+        payload["branch"] = applyability.get("branch")
+        payload["target_branch"] = applyability.get("target_branch")
+        payload["local_ahead"] = applyability.get("ahead")
+        payload["dirty_worktree"] = applyability.get("dirty")
+        payload["dirty_entries"] = applyability.get("dirty_entries")
+        payload["apply_block_reason"] = applyability.get("reason")
+        if not applyability.get("can_apply", True):
+            payload["can_apply"] = False
+            payload["message"] = applyability.get("message") or payload["message"]
+
     if install_method == "docker":
         payload["message"] = format_docker_update_message()
         return payload
@@ -3632,9 +3727,9 @@ async def check_hermes_update(force: bool = False):
 
     payload["behind"] = behind
     if behind is None:
-        payload["message"] = "Couldn't reach the update source — try again later."
+        payload["message"] = payload["message"] or "Couldn't reach the update source — try again later."
     elif behind == 0:
-        payload["message"] = "You're on the latest version."
+        payload["message"] = payload["message"] or "You're on the latest version."
     else:
         payload["update_available"] = True
         # Enrich with the actual commits we're behind by, so the desktop's
