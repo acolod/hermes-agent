@@ -18,6 +18,7 @@ Environment variables:
 import asyncio
 import email as email_lib
 import imaplib
+import json
 import logging
 import os
 import re
@@ -25,6 +26,9 @@ import smtplib
 import socket
 import ssl
 import uuid
+import urllib.error
+import urllib.request
+import base64
 from email.header import decode_header
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -359,6 +363,14 @@ def _verify_sender_authentication(
     return False, f"authentication failed ({trusted[:120]})"
 
 
+def _email_domain(raw: str) -> str:
+    """Extract the domain part from an email or display-name address."""
+    addr = _extract_email_address(raw)
+    if "@" not in addr:
+        raise ValueError(f"Invalid email address: {raw}")
+    return addr.split("@", 1)[1]
+
+
 def _extract_attachments(
     msg: email_lib.message.Message,
     skip_attachments: bool = False,
@@ -442,6 +454,12 @@ class EmailAdapter(BasePlatformAdapter):
         self._smtp_port = env_int("EMAIL_SMTP_PORT", 587)
         self._poll_interval = env_int("EMAIL_POLL_INTERVAL", 15)
 
+        # Extra behavior is configured via config.yaml under platforms.email.extra.
+        self._login_address = (extra.get("login_address") or self._address).strip()
+        self._from_address = (extra.get("from_address") or self._login_address).strip()
+        self._reply_to_address = (extra.get("reply_to_address") or self._from_address).strip()
+        self._resend_api_key_path = (extra.get("resend_api_key_path") or "").strip()
+
         # Skip attachments — configured via config.yaml:
         #   platforms:
         #     email:
@@ -484,7 +502,87 @@ class EmailAdapter(BasePlatformAdapter):
         # Map chat_id (sender email) -> last subject + message-id for threading
         self._thread_context: Dict[str, Dict[str, str]] = {}
 
-        logger.info("[Email] Adapter initialized for %s", self._address)
+        logger.info(
+            "[Email] Adapter initialized (login=%s, from=%s, reply_to=%s, resend=%s)",
+            self._login_address,
+            self._from_address,
+            self._reply_to_address,
+            bool(self._resend_api_key_path),
+        )
+
+    def _build_reply_subject(self, to_addr: str) -> str:
+        ctx = self._thread_context.get(to_addr, {})
+        subject = ctx.get("subject", "Hermes Agent")
+        if not subject.startswith("Re:"):
+            subject = f"Re: {subject}"
+        return subject
+
+    def _build_thread_headers(self, to_addr: str, reply_to_msg_id: Optional[str] = None) -> tuple[str, dict[str, str]]:
+        ctx = self._thread_context.get(to_addr, {})
+        msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{_email_domain(self._from_address)}>"
+        headers = {
+            "Date": formatdate(localtime=True),
+            "Message-ID": msg_id,
+        }
+        original_msg_id = reply_to_msg_id or ctx.get("message_id")
+        if original_msg_id:
+            headers["In-Reply-To"] = original_msg_id
+            headers["References"] = original_msg_id
+        return msg_id, headers
+
+    def _read_resend_api_key(self) -> str:
+        if not self._resend_api_key_path:
+            raise RuntimeError("Resend is not configured for the email adapter")
+        return Path(self._resend_api_key_path).read_text(encoding="utf-8").strip()
+
+    def _send_via_resend(
+        self,
+        *,
+        to_addr: str,
+        subject: str,
+        body: str,
+        headers: Dict[str, str],
+        attachments: Optional[List[Tuple[str, bytes]]] = None,
+    ) -> str:
+        msg_id = headers.get("Message-ID") or f"<hermes-{uuid.uuid4().hex[:12]}@{self._from_address.split('@')[1]}>"
+        payload: Dict[str, Any] = {
+            "from": self._from_address,
+            "to": [to_addr],
+            "subject": subject,
+            "text": body,
+            "reply_to": self._reply_to_address,
+            "headers": headers,
+        }
+        if attachments:
+            payload["attachments"] = [
+                {
+                    "filename": filename,
+                    "content": base64.b64encode(content).decode("ascii"),
+                }
+                for filename, content in attachments
+            ]
+        req = urllib.request.Request(
+            "https://api.resend.com/emails",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {self._read_resend_api_key()}",
+                "Content-Type": "application/json",
+                "User-Agent": "Hermes-EmailAdapter/1.0",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                response = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            body_text = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Resend HTTP {exc.code}: {body_text}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Resend connection failed: {exc}") from exc
+
+        resend_id = response.get("id")
+        logger.info("[Email] Sent via Resend to %s (subject: %s, resend_id=%s)", to_addr, subject, resend_id)
+        return msg_id
 
     def _trim_seen_uids(self) -> None:
         """Keep only the most recent UIDs to prevent unbounded memory growth.
@@ -583,7 +681,7 @@ class EmailAdapter(BasePlatformAdapter):
         try:
             # Test IMAP connection
             imap = imaplib.IMAP4_SSL(self._imap_host, self._imap_port, timeout=30)
-            imap.login(self._address, self._password)
+            imap.login(self._login_address, self._password)
             _send_imap_id(imap)
             # Mark all existing messages as seen so we only process new ones
             imap.select("INBOX")
@@ -603,7 +701,7 @@ class EmailAdapter(BasePlatformAdapter):
             # Test SMTP connection
             smtp = self._connect_smtp()
             try:
-                smtp.login(self._address, self._password)
+                smtp.login(self._login_address, self._password)
             finally:
                 smtp.quit()
             logger.info("[Email] SMTP connection test passed.")
@@ -613,7 +711,7 @@ class EmailAdapter(BasePlatformAdapter):
 
         self._running = True
         self._poll_task = asyncio.create_task(self._poll_loop())
-        print(f"[Email] Connected as {self._address}")
+        print(f"[Email] Connected as {self._login_address} (public from: {self._from_address})")
         return True
 
     async def disconnect(self) -> None:
@@ -653,7 +751,7 @@ class EmailAdapter(BasePlatformAdapter):
         try:
             imap = imaplib.IMAP4_SSL(self._imap_host, self._imap_port, timeout=30)
             try:
-                imap.login(self._address, self._password)
+                imap.login(self._login_address, self._password)
                 _send_imap_id(imap)
                 imap.select("INBOX")
 
@@ -779,8 +877,9 @@ class EmailAdapter(BasePlatformAdapter):
         """Convert a fetched email into a MessageEvent and dispatch it."""
         sender_addr = msg_data["sender_addr"]
 
-        # Skip self-messages
-        if sender_addr == self._address.lower():
+        # Skip self-messages from either the login mailbox or the public alias.
+        sender_addr_lc = sender_addr.lower()
+        if sender_addr_lc in {self._login_address.lower(), self._from_address.lower()}:
             return
 
         # Never reply to automated senders
@@ -924,33 +1023,32 @@ class EmailAdapter(BasePlatformAdapter):
         body: str,
         reply_to_msg_id: Optional[str] = None,
     ) -> str:
-        """Send an email via SMTP. Runs in executor thread."""
+        """Send an email reply. Runs in executor thread."""
+        subject = self._build_reply_subject(to_addr)
+        msg_id, headers = self._build_thread_headers(to_addr, reply_to_msg_id)
+
+        if self._resend_api_key_path:
+            return self._send_via_resend(
+                to_addr=to_addr,
+                subject=subject,
+                body=body,
+                headers=headers,
+            )
+
         msg = MIMEMultipart()
-        msg["From"] = self._address
+        msg["From"] = self._from_address
         msg["To"] = to_addr
-
-        # Thread context for reply
-        ctx = self._thread_context.get(to_addr, {})
-        subject = ctx.get("subject", "Hermes Agent")
-        if not subject.startswith("Re:"):
-            subject = f"Re: {subject}"
         msg["Subject"] = subject
-
-        # Threading headers
-        original_msg_id = reply_to_msg_id or ctx.get("message_id")
-        if original_msg_id:
-            msg["In-Reply-To"] = original_msg_id
-            msg["References"] = original_msg_id
-
-        msg["Date"] = formatdate(localtime=True)
-        msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._message_id_domain()}>"
-        msg["Message-ID"] = msg_id
+        for header_name, header_value in headers.items():
+            msg[header_name] = header_value
+        if self._reply_to_address:
+            msg["Reply-To"] = self._reply_to_address
 
         msg.attach(MIMEText(body, "plain", "utf-8"))
 
         smtp = self._connect_smtp()
         try:
-            smtp.login(self._address, self._password)
+            smtp.login(self._login_address, self._password)
             smtp.send_message(msg)
         finally:
             try:
@@ -1039,25 +1137,34 @@ class EmailAdapter(BasePlatformAdapter):
         body: str,
         file_paths: List[str],
     ) -> str:
-        """Send an email with multiple file attachments via SMTP."""
+        """Send an email with multiple file attachments."""
+        subject = self._build_reply_subject(to_addr)
+        msg_id, headers = self._build_thread_headers(to_addr)
+
+        if self._resend_api_key_path:
+            attachments: List[Tuple[str, bytes]] = []
+            for file_path in file_paths:
+                p = Path(file_path)
+                try:
+                    attachments.append((p.name, p.read_bytes()))
+                except Exception as e:
+                    logger.warning("[Email] Failed to attach %s for Resend: %s", file_path, e)
+            return self._send_via_resend(
+                to_addr=to_addr,
+                subject=subject,
+                body=body,
+                headers=headers,
+                attachments=attachments,
+            )
+
         msg = MIMEMultipart()
-        msg["From"] = self._address
+        msg["From"] = self._from_address
         msg["To"] = to_addr
-
-        ctx = self._thread_context.get(to_addr, {})
-        subject = ctx.get("subject", "Hermes Agent")
-        if not subject.startswith("Re:"):
-            subject = f"Re: {subject}"
         msg["Subject"] = subject
-
-        original_msg_id = ctx.get("message_id")
-        if original_msg_id:
-            msg["In-Reply-To"] = original_msg_id
-            msg["References"] = original_msg_id
-
-        msg["Date"] = formatdate(localtime=True)
-        msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._message_id_domain()}>"
-        msg["Message-ID"] = msg_id
+        for header_name, header_value in headers.items():
+            msg[header_name] = header_value
+        if self._reply_to_address:
+            msg["Reply-To"] = self._reply_to_address
 
         if body:
             msg.attach(MIMEText(body, "plain", "utf-8"))
@@ -1076,7 +1183,7 @@ class EmailAdapter(BasePlatformAdapter):
 
         smtp = self._connect_smtp()
         try:
-            smtp.login(self._address, self._password)
+            smtp.login(self._login_address, self._password)
             smtp.send_message(msg)
         finally:
             try:
@@ -1119,32 +1226,34 @@ class EmailAdapter(BasePlatformAdapter):
         file_path: str,
         file_name: Optional[str] = None,
     ) -> str:
-        """Send an email with a file attachment via SMTP."""
+        """Send an email with a file attachment."""
+        subject = self._build_reply_subject(to_addr)
+        msg_id, headers = self._build_thread_headers(to_addr)
+        p = Path(file_path)
+        fname = file_name or p.name
+
+        if self._resend_api_key_path:
+            return self._send_via_resend(
+                to_addr=to_addr,
+                subject=subject,
+                body=body,
+                headers=headers,
+                attachments=[(fname, p.read_bytes())],
+            )
+
         msg = MIMEMultipart()
-        msg["From"] = self._address
+        msg["From"] = self._from_address
         msg["To"] = to_addr
-
-        ctx = self._thread_context.get(to_addr, {})
-        subject = ctx.get("subject", "Hermes Agent")
-        if not subject.startswith("Re:"):
-            subject = f"Re: {subject}"
         msg["Subject"] = subject
-
-        original_msg_id = ctx.get("message_id")
-        if original_msg_id:
-            msg["In-Reply-To"] = original_msg_id
-            msg["References"] = original_msg_id
-
-        msg["Date"] = formatdate(localtime=True)
-        msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._message_id_domain()}>"
-        msg["Message-ID"] = msg_id
+        for header_name, header_value in headers.items():
+            msg[header_name] = header_value
+        if self._reply_to_address:
+            msg["Reply-To"] = self._reply_to_address
 
         if body:
             msg.attach(MIMEText(body, "plain", "utf-8"))
 
         # Attach file
-        p = Path(file_path)
-        fname = file_name or p.name
         with open(p, "rb") as f:
             part = MIMEBase("application", "octet-stream")
             part.set_payload(f.read())
@@ -1154,7 +1263,7 @@ class EmailAdapter(BasePlatformAdapter):
 
         smtp = self._connect_smtp()
         try:
-            smtp.login(self._address, self._password)
+            smtp.login(self._login_address, self._password)
             smtp.send_message(msg)
         finally:
             try:

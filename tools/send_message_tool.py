@@ -1643,11 +1643,6 @@ async def _send_signal(extra, chat_id, message, media_files=None):
 # wired via standalone_sender_fn, reached through _registry_standalone_send. #41112.
 
 
-# _send_matrix moved to plugins/platforms/matrix/adapter.py::_standalone_send,
-# wired via standalone_sender_fn and reached through _registry_standalone_send. #41112.
-# (_send_matrix_via_adapter below stays — it's the native-media upload path.)
-
-
 async def _send_matrix_via_adapter(pconfig, chat_id, message, media_files=None, thread_id=None):
     """Send via the Matrix adapter so native Matrix media uploads are preserved.
 
