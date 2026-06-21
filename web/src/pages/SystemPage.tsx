@@ -644,6 +644,17 @@ export default function SystemPage() {
   const validEvents = hooks?.valid_events?.length
     ? hooks.valid_events
     : HOOK_EVENTS_FALLBACK;
+  const updateCommandLabel = updateInfo?.update_command ?? "hermes update";
+  const usesLocalLiveUpdateWorkflow = updateCommandLabel === "hermes-local-update";
+  const updateDialogTitle = usesLocalLiveUpdateWorkflow
+    ? "Update Hermes via local/live workflow?"
+    : "Update Hermes?";
+  const updateDialogConfirmLabel = usesLocalLiveUpdateWorkflow
+    ? "Run local/live update"
+    : "Update now";
+  const updateButtonLabel = usesLocalLiveUpdateWorkflow
+    ? "Update via local/live"
+    : "Update now";
 
   return (
     <div className="flex flex-col gap-8">
@@ -662,13 +673,13 @@ export default function SystemPage() {
         open={canUpdateHermes && updateConfirmOpen}
         onCancel={() => setUpdateConfirmOpen(false)}
         onConfirm={() => void applyUpdate()}
-        title="Update Hermes?"
+        title={updateDialogTitle}
         description={
           updateInfo && updateInfo.behind && updateInfo.behind > 0
-            ? `This will run '${updateInfo.update_command}' and pull ${updateInfo.behind} new commit${updateInfo.behind === 1 ? "" : "s"}. The gateway restarts when the update finishes; the current session keeps its prompt cache until then.`
-            : `This will run '${updateInfo?.update_command ?? "hermes update"}' and restart the gateway when it finishes.`
+            ? `This will run '${updateCommandLabel}' and pull ${updateInfo.behind} new commit${updateInfo.behind === 1 ? "" : "s"}. The gateway restarts when the update finishes; the current session keeps its prompt cache until then.`
+            : `This will run '${updateCommandLabel}' and restart the gateway when it finishes.`
         }
-        confirmLabel="Update now"
+        confirmLabel={updateDialogConfirmLabel}
       />
 
       <DeleteConfirmDialog
@@ -933,7 +944,7 @@ export default function SystemPage() {
                     prefix={<Download className="h-3.5 w-3.5" />}
                     onClick={() => setUpdateConfirmOpen(true)}
                   >
-                    Update now
+                    {updateButtonLabel}
                   </Button>
                 )}
                 {updateInfo &&
