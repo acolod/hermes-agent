@@ -965,6 +965,40 @@ class TestUpdateCheckEndpoint:
         assert body["apply_block_reason"] == "local_commits"
         assert body["message"] == "local repo diverged"
 
+    def test_git_check_allows_local_live_update_via_wrapper(self, monkeypatch):
+        import hermes_cli.web_server as ws
+        import hermes_cli.banner as banner
+
+        monkeypatch.setattr(ws, "detect_install_method", lambda *a, **k: "git")
+        monkeypatch.setattr(banner, "check_for_updates", lambda: 5)
+        monkeypatch.setattr(
+            ws,
+            "_git_update_applyability",
+            lambda target_branch="main": {
+                "can_apply": True,
+                "branch": "local/live",
+                "target_branch": target_branch,
+                "ahead": 5,
+                "dirty": False,
+                "dirty_entries": 0,
+                "reason": "local_live_update",
+                "message": "Use hermes-local-update for the local/live runtime branch.",
+                "update_command": "hermes-local-update",
+                "spawn_mode": "external",
+                "spawn_command": ["/home/alex/.local/bin/hermes-local-update"],
+            },
+        )
+
+        body = self.client.get("/api/hermes/update/check").json()
+        assert body["behind"] == 5
+        assert body["update_available"] is True
+        assert body["can_apply"] is True
+        assert body["branch"] == "local/live"
+        assert body["local_ahead"] == 5
+        assert body["apply_block_reason"] == "local_live_update"
+        assert body["update_command"] == "hermes-local-update"
+        assert body["message"] == "Use hermes-local-update for the local/live runtime branch."
+
     def test_up_to_date_omits_commits(self, monkeypatch):
         import hermes_cli.web_server as ws
         import hermes_cli.banner as banner

@@ -3200,12 +3200,14 @@ def _dashboard_spawn_executable() -> str:
     return exe
 
 
-def _spawn_hermes_action(subcommand: List[str], name: str) -> subprocess.Popen:
-    """Spawn ``hermes <subcommand>`` detached and record the Popen handle.
-
-    Uses the running interpreter's ``hermes_cli.main`` module so the action
-    inherits the same venv/PYTHONPATH the web server is using.
-    """
+def _spawn_detached_action(
+    command: List[str],
+    name: str,
+    *,
+    cwd: Path | None = None,
+    extra_env: Dict[str, str] | None = None,
+) -> subprocess.Popen:
+    """Spawn a detached background action and track it under ``name``."""
     log_file_name = _ACTION_LOG_FILES[name]
     _ACTION_LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_path = _ACTION_LOG_DIR / log_file_name
@@ -3214,29 +3216,41 @@ def _spawn_hermes_action(subcommand: List[str], name: str) -> subprocess.Popen:
         f"\n=== {name} started {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n".encode()
     )
 
-    cmd = [_dashboard_spawn_executable(), "-m", "hermes_cli.main", *subcommand]
+    env = {**os.environ, "HERMES_NONINTERACTIVE": "1"}
+    if extra_env:
+        env.update(extra_env)
 
     popen_kwargs: Dict[str, Any] = {
-        "cwd": str(PROJECT_ROOT),
+        "cwd": str((cwd or PROJECT_ROOT).resolve()),
         "stdin": subprocess.DEVNULL,
         "stdout": log_file,
         "stderr": subprocess.STDOUT,
-        "env": {**os.environ, "HERMES_NONINTERACTIVE": "1"},
+        "env": env,
     }
     if sys.platform == "win32":
         popen_kwargs["creationflags"] = windows_detach_flags()
     else:
         popen_kwargs["start_new_session"] = True
 
-    proc = subprocess.Popen(cmd, **popen_kwargs)
+    proc = subprocess.Popen(command, **popen_kwargs)
     # The child inherits its own duplicated fd for stdout/stderr, so the
     # parent's handle can be released immediately — otherwise we leak one
     # fd per spawned action.
     log_file.close()
     _ACTION_RESULTS.pop(name, None)
-    _ACTION_COMMANDS[name] = tuple(subcommand)
+    _ACTION_COMMANDS[name] = tuple(command)
     _ACTION_PROCS[name] = proc
     return proc
+
+
+def _spawn_hermes_action(subcommand: List[str], name: str) -> subprocess.Popen:
+    """Spawn ``hermes <subcommand>`` detached and record the Popen handle.
+
+    Uses the running interpreter's ``hermes_cli.main`` module so the action
+    inherits the same venv/PYTHONPATH the web server is using.
+    """
+    cmd = [_dashboard_spawn_executable(), "-m", "hermes_cli.main", *subcommand]
+    return _spawn_detached_action(cmd, name)
 
 
 def _tail_lines(path: Path, n: int) -> List[str]:
@@ -3509,8 +3523,23 @@ async def update_hermes():
                 "name": "hermes-update",
                 "error": "git_update_not_applyable",
                 "message": message,
-                "update_command": "git fetch origin && git reset --hard origin/main",
+                "update_command": applyability.get("update_command")
+                or "git fetch origin && git reset --hard origin/main",
             }
+        try:
+            if applyability.get("spawn_mode") == "external":
+                spawn_command = applyability.get("spawn_command") or []
+                proc = _spawn_detached_action(spawn_command, "hermes-update")
+            else:
+                proc = _spawn_hermes_action(["update"], "hermes-update")
+        except Exception as exc:
+            _log.exception("Failed to spawn hermes update")
+            raise HTTPException(status_code=500, detail=f"Failed to start update: {exc}")
+        return {
+            "ok": True,
+            "pid": proc.pid,
+            "name": "hermes-update",
+        }
 
     try:
         proc = _spawn_hermes_action(["update"], "hermes-update")
@@ -3572,6 +3601,29 @@ def _recent_upstream_commits(n: int = 20) -> List[Dict[str, Any]]:
         return []
 
 
+def _resolve_local_live_update_command() -> Optional[List[str]]:
+    """Return the preferred update wrapper for ``local/live`` runtimes.
+
+    We prefer a dedicated wrapper over the dashboard's plain ``hermes update``
+    path because the wrapper refreshes ``main`` and rebases the live carry lane.
+    """
+    candidates: List[Path] = []
+    from_path = shutil.which("hermes-local-update")
+    if from_path:
+        candidates.append(Path(from_path))
+    candidates.append(Path.home() / ".local/bin/hermes-local-update")
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        candidate_str = str(candidate)
+        if candidate_str in seen:
+            continue
+        seen.add(candidate_str)
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return [candidate_str]
+    return None
+
+
 def _git_update_applyability(target_branch: str = "main") -> Dict[str, Any]:
     """Best-effort preflight for dashboard-triggered git updates.
 
@@ -3587,6 +3639,9 @@ def _git_update_applyability(target_branch: str = "main") -> Dict[str, Any]:
         "dirty_entries": 0,
         "reason": None,
         "message": None,
+        "update_command": None,
+        "spawn_mode": "hermes",
+        "spawn_command": ["update"],
     }
 
     try:
@@ -3618,6 +3673,19 @@ def _git_update_applyability(target_branch: str = "main") -> Dict[str, Any]:
             dirty_entries = len([line for line in (status_result.stdout or "").splitlines() if line.strip()])
             payload["dirty_entries"] = dirty_entries
             payload["dirty"] = dirty_entries > 0
+
+        if payload["branch"] == "local/live" and payload["ahead"] > 0:
+            local_live_command = _resolve_local_live_update_command()
+            if local_live_command and not payload["dirty"]:
+                payload["reason"] = "local_live_update"
+                payload["message"] = (
+                    "This Hermes runtime uses the local/live carry workflow. "
+                    "The dashboard will run hermes-local-update so your local carries are rebased onto updated upstream main."
+                )
+                payload["update_command"] = Path(local_live_command[0]).name
+                payload["spawn_mode"] = "external"
+                payload["spawn_command"] = local_live_command
+                return payload
 
         if payload["ahead"] > 0:
             payload["can_apply"] = False
@@ -3700,9 +3768,12 @@ async def check_hermes_update(force: bool = False):
         payload["dirty_worktree"] = applyability.get("dirty")
         payload["dirty_entries"] = applyability.get("dirty_entries")
         payload["apply_block_reason"] = applyability.get("reason")
+        if applyability.get("update_command"):
+            payload["update_command"] = applyability.get("update_command")
+        if applyability.get("message"):
+            payload["message"] = applyability.get("message")
         if not applyability.get("can_apply", True):
             payload["can_apply"] = False
-            payload["message"] = applyability.get("message") or payload["message"]
 
     if install_method == "docker":
         payload["message"] = format_docker_update_message()

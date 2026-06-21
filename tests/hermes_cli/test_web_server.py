@@ -1832,6 +1832,49 @@ class TestWebServerEndpoints:
         assert status_data["pid"] is None
         assert any("local repo diverged" in line for line in status_data["lines"])
 
+    def test_update_hermes_uses_local_live_update_wrapper_when_available(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        class Proc:
+            pid = 67890
+
+            def poll(self):
+                return None
+
+        calls = []
+
+        def fake_spawn(command, name):
+            calls.append((command, name))
+            return Proc()
+
+        monkeypatch.setattr(web_server, "detect_install_method", lambda _root: "git")
+        monkeypatch.setattr(
+            web_server,
+            "_git_update_applyability",
+            lambda target_branch="main": {
+                "can_apply": True,
+                "branch": "local/live",
+                "target_branch": target_branch,
+                "ahead": 5,
+                "dirty": False,
+                "dirty_entries": 0,
+                "reason": "local_live_update",
+                "message": "Use hermes-local-update for the local/live runtime branch.",
+                "update_command": "hermes-local-update",
+                "spawn_mode": "external",
+                "spawn_command": ["/home/alex/.local/bin/hermes-local-update"],
+            },
+        )
+        monkeypatch.setattr(web_server, "_spawn_detached_action", fake_spawn)
+        web_server._ACTION_PROCS.pop("hermes-update", None)
+        web_server._ACTION_RESULTS.pop("hermes-update", None)
+
+        resp = self.client.post("/api/hermes/update")
+
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True, "pid": 67890, "name": "hermes-update"}
+        assert calls == [(["/home/alex/.local/bin/hermes-local-update"], "hermes-update")]
+
     def test_action_status_reaps_completed_process(self, monkeypatch):
         import hermes_cli.web_server as web_server
 
