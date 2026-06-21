@@ -423,6 +423,34 @@ class TestWebServerEndpoints:
         assert resp.status_code == 200
         assert resp.json()["can_update_hermes"] is False
 
+    def test_get_status_keeps_local_live_update_available_in_container(self, monkeypatch):
+        import hermes_constants
+        import hermes_cli.web_server as web_server
+
+        monkeypatch.setattr(hermes_constants, "is_container", lambda: True)
+        monkeypatch.setattr(
+            web_server,
+            "_git_update_applyability",
+            lambda target_branch="main": {
+                "can_apply": True,
+                "branch": "local/live",
+                "target_branch": target_branch,
+                "ahead": 2,
+                "dirty": False,
+                "dirty_entries": 0,
+                "reason": "local_live_update",
+                "message": "Use hermes-local-update for the local/live runtime branch.",
+                "update_command": "hermes-local-update",
+                "spawn_mode": "external",
+                "spawn_command": ["/home/alex/.local/bin/hermes-local-update"],
+            },
+        )
+
+        resp = self.client.get("/api/status")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["can_update_hermes"] is True
+
     def test_dashboard_update_capability_detects_generic_container(self, monkeypatch):
         import hermes_constants
         import hermes_cli.web_server as web_server

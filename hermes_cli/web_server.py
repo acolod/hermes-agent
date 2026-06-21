@@ -1628,17 +1628,17 @@ def _default_hermes_root_is_opt_data() -> bool:
 def _dashboard_local_update_managed_externally() -> bool:
     """Return true when the dashboard should not offer ``hermes update``.
 
-    Containerized dashboards are updated by the outer launcher/image, not by an
-    in-browser local update action. Keep this dashboard capability separate
-    from install-method detection: manual git/pip installs inside containers can
-    still behave like their actual install method in the CLI.
+    Containerized dashboards are normally updated by the outer launcher/image,
+    not by an in-browser local update action. Keep this dashboard capability
+    separate from install-method detection: manual git/pip installs inside
+    containers can still behave like their actual install method in the CLI.
 
-    However, when the install method is ``git`` (a bind-mounted checkout inside
-    a container — e.g. the hermes-webui image sharing the Hermes source tree),
-    the dashboard's ``hermes update`` button is the correct update path and
-    should not be suppressed. Other containerized install methods remain
-    externally managed unless their apply path is proven safe inside the
-    running container filesystem.
+    Exceptions:
+    * a ``local/live`` checkout with a valid ``hermes-local-update`` wrapper is
+      intentionally updatable from the dashboard, because that path rebases
+      carries onto upstream safely;
+    * a git checkout bind-mounted into a container can still self-update through
+      the mounted source tree.
     """
     if _default_hermes_root_is_opt_data():
         return True
@@ -1649,18 +1649,26 @@ def _dashboard_local_update_managed_externally() -> bool:
             return False
     except Exception:
         return False
+
     # We are inside a container, but the install may still be self-managed.
     # If the install method is git, the dashboard update button works against
-    # the mounted checkout and should be offered. Keep pip blocked inside
-    # containers: its apply path mutates the running container filesystem and
-    # is not the bind-mounted checkout case this gate is meant to recover.
+    # the mounted checkout and should be offered. Keep pip/docker blocked inside
+    # containers: their apply paths mutate the running container filesystem and
+    # are not the bind-mounted checkout case this gate is meant to recover.
     try:
         method = detect_install_method(PROJECT_ROOT)
-        if method == "git":
+        if method != "git":
+            return True
+    except Exception:
+        return True
+
+    try:
+        applyability = _git_update_applyability()
+        if applyability.get("reason") == "local_live_update":
             return False
     except Exception:
         pass
-    return True
+    return False
 
 
 def _managed_files_policy(request: Request, *, create_root: bool = True) -> ManagedFilesPolicy:
