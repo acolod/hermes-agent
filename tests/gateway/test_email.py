@@ -857,6 +857,126 @@ class TestThreadContext(unittest.TestCase):
             self.assertIn("Date", send_call)
 
 
+class TestHtmlEmailFormatting(unittest.TestCase):
+    """Test rich email formatting keeps plain-text fallback and safe HTML."""
+
+    def _make_adapter(self, *, extra=None):
+        from gateway.config import PlatformConfig
+        with patch.dict(os.environ, {
+            "EMAIL_ADDRESS": "hermes@test.com",
+            "EMAIL_PASSWORD": "secret",
+            "EMAIL_IMAP_HOST": "imap.test.com",
+            "EMAIL_SMTP_HOST": "smtp.test.com",
+        }):
+            from plugins.platforms.email.adapter import EmailAdapter
+            adapter = EmailAdapter(PlatformConfig(enabled=True, extra=extra or {}))
+        return adapter
+
+    def test_smtp_reply_sends_multipart_alternative_with_html_and_plain_text(self):
+        adapter = self._make_adapter()
+        body = "# Plan\n\nHere is **the move**.\n\n- First item\n- Second item"
+
+        with patch("smtplib.SMTP") as mock_smtp:
+            mock_server = MagicMock()
+            mock_smtp.return_value = mock_server
+
+            adapter._send_email("user@test.com", body, None)
+
+        msg = mock_server.send_message.call_args[0][0]
+        alternatives = [part for part in msg.walk() if part.get_content_type() == "multipart/alternative"]
+        self.assertEqual(len(alternatives), 1)
+        plain_parts = [part for part in msg.walk() if part.get_content_type() == "text/plain"]
+        html_parts = [part for part in msg.walk() if part.get_content_type() == "text/html"]
+        self.assertEqual(len(plain_parts), 1)
+        self.assertEqual(len(html_parts), 1)
+        self.assertEqual(plain_parts[0].get_payload(decode=True).decode("utf-8"), body)
+        html = html_parts[0].get_payload(decode=True).decode("utf-8")
+        self.assertIn("<h1>Plan</h1>", html)
+        self.assertIn("<strong>the move</strong>", html)
+        self.assertIn("<li>First item</li>", html)
+
+    def test_html_formatter_escapes_raw_html_and_strips_reasoning_blocks(self):
+        from plugins.platforms.email.adapter import _prepare_email_bodies
+
+        plain, html = _prepare_email_bodies(
+            "💭 **Reasoning:**\n```\nprivate scratch\n```\n\n# Result\n<script>alert('x')</script>"
+        )
+
+        self.assertNotIn("private scratch", plain)
+        self.assertNotIn("Reasoning", plain)
+        self.assertIn("# Result", plain)
+        self.assertIn("&lt;script&gt;alert(&#x27;x&#x27;)&lt;/script&gt;", html)
+        self.assertNotIn("<script>", html)
+
+    def test_resend_payload_includes_html_and_text(self):
+        adapter = self._make_adapter(extra={"resend_api_key_path": "/tmp/resend-key"})
+        body = "## Summary\n\nUse **HTML** in Gmail."
+        captured = {}
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+            def __exit__(self, exc_type, exc, tb):
+                return False
+            def read(self):
+                return b'{"id":"email_123"}'
+
+        def fake_urlopen(req, timeout):
+            captured["payload"] = __import__("json").loads(req.data.decode("utf-8"))
+            return FakeResponse()
+
+        with patch.object(adapter, "_read_resend_api_key", return_value="test-key"), \
+             patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            adapter._send_via_resend(
+                to_addr="user@test.com",
+                subject="Re: Project",
+                body=body,
+                headers={"Message-ID": "<msg@test>"},
+            )
+
+        self.assertEqual(captured["payload"]["text"], body)
+        self.assertIn("<h2>Summary</h2>", captured["payload"]["html"])
+        self.assertIn("<strong>HTML</strong>", captured["payload"]["html"])
+
+    def test_plain_format_opt_out_keeps_single_plain_part(self):
+        adapter = self._make_adapter(extra={"format": "plain"})
+
+        with patch("smtplib.SMTP") as mock_smtp:
+            mock_server = MagicMock()
+            mock_smtp.return_value = mock_server
+
+            adapter._send_email("user@test.com", "# Plain only", None)
+
+        msg = mock_server.send_message.call_args[0][0]
+        self.assertEqual([p.get_content_type() for p in msg.walk()].count("text/html"), 0)
+        self.assertEqual([p.get_content_type() for p in msg.walk()].count("text/plain"), 1)
+
+    def test_standalone_sender_uses_html_and_plain_alternative(self):
+        import asyncio
+        from gateway.config import PlatformConfig
+        from plugins.platforms.email.adapter import _standalone_send
+
+        cfg = PlatformConfig(enabled=True, extra={
+            "address": "hermes@test.com",
+            "smtp_host": "smtp.test.com",
+            "format": "html",
+        })
+
+        with patch.dict(os.environ, {"EMAIL_PASSWORD": "secret", "EMAIL_SMTP_PORT": "587"}), \
+             patch("smtplib.SMTP") as mock_smtp:
+            mock_server = MagicMock()
+            mock_smtp.return_value = mock_server
+
+            result = asyncio.run(_standalone_send(cfg, "user@test.com", "# Cron result"))
+
+        self.assertTrue(result["success"])
+        msg = mock_server.send_message.call_args[0][0]
+        self.assertEqual([p.get_content_type() for p in msg.walk()].count("text/plain"), 1)
+        self.assertEqual([p.get_content_type() for p in msg.walk()].count("text/html"), 1)
+        html = [p for p in msg.walk() if p.get_content_type() == "text/html"][0].get_payload(decode=True).decode("utf-8")
+        self.assertIn("<h1>Cron result</h1>", html)
+
+
 class TestSendMethods(unittest.TestCase):
     """Test email send methods."""
 

@@ -17,6 +17,7 @@ Environment variables:
 
 import asyncio
 import email as email_lib
+import html
 import imaplib
 import json
 import logging
@@ -127,6 +128,120 @@ class _IPv4SMTP_SSL(smtplib.SMTP_SSL):
 
 # Supported image extensions for inline detection
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+
+_REASONING_PREFIX_RE = re.compile(
+    r"^\s*(?:💭\s*)?(?:\*\*)?Reasoning:?(?:\*\*)?\s*\n+```.*?```\s*\n*",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _strip_email_scratch(text: str) -> str:
+    """Remove gateway-only scratch blocks that should never be emailed."""
+    return _REASONING_PREFIX_RE.sub("", text or "").lstrip()
+
+
+def _inline_markdown_to_html(text: str) -> str:
+    """Escape text, then apply a small safe subset of Markdown inline styling."""
+    escaped = html.escape(text, quote=True)
+    escaped = re.sub(
+        r"\[([^\]\n]+)\]\((https?://[^\s)]+)\)",
+        r'<a href="\2">\1</a>',
+        escaped,
+    )
+    escaped = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", escaped)
+    escaped = re.sub(r"`([^`]+)`", r"<code>\1</code>", escaped)
+    return escaped
+
+
+def _markdown_to_email_html(text: str) -> str:
+    """Render a conservative, Gmail-friendly HTML body from plain Markdown.
+
+    This intentionally avoids external dependencies and allows only generated
+    tags from a small subset of Markdown. Raw HTML in the model output is always
+    escaped, which keeps email delivery from becoming an HTML/script injection
+    path while still making headings, bullets, links, and emphasis readable.
+    """
+    lines = (text or "").splitlines()
+    parts: List[str] = []
+    in_ul = False
+    in_ol = False
+
+    def close_lists() -> None:
+        nonlocal in_ul, in_ol
+        if in_ul:
+            parts.append("</ul>")
+            in_ul = False
+        if in_ol:
+            parts.append("</ol>")
+            in_ol = False
+
+    for raw_line in lines:
+        line = raw_line.rstrip()
+        if not line.strip():
+            close_lists()
+            continue
+
+        heading = re.match(r"^(#{1,3})\s+(.+)$", line)
+        if heading:
+            close_lists()
+            level = len(heading.group(1))
+            parts.append(f"<h{level}>{_inline_markdown_to_html(heading.group(2).strip())}</h{level}>")
+            continue
+
+        bullet = re.match(r"^\s*[-*]\s+(.+)$", line)
+        if bullet:
+            if in_ol:
+                parts.append("</ol>")
+                in_ol = False
+            if not in_ul:
+                parts.append("<ul>")
+                in_ul = True
+            parts.append(f"<li>{_inline_markdown_to_html(bullet.group(1).strip())}</li>")
+            continue
+
+        numbered = re.match(r"^\s*\d+[.)]\s+(.+)$", line)
+        if numbered:
+            if in_ul:
+                parts.append("</ul>")
+                in_ul = False
+            if not in_ol:
+                parts.append("<ol>")
+                in_ol = True
+            parts.append(f"<li>{_inline_markdown_to_html(numbered.group(1).strip())}</li>")
+            continue
+
+        close_lists()
+        parts.append(f"<p>{_inline_markdown_to_html(line.strip())}</p>")
+
+    close_lists()
+    body = "\n".join(parts) or "<p></p>"
+    return (
+        "<!doctype html>\n"
+        "<html><body style=\"font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;"
+        "line-height:1.55;color:#1f2937;background:#ffffff;margin:0;padding:0;\">\n"
+        "<div style=\"max-width:760px;margin:0 auto;padding:24px;\">\n"
+        f"{body}\n"
+        "</div></body></html>"
+    )
+
+
+def _prepare_email_bodies(body: str) -> tuple[str, str]:
+    """Return sanitized plain text plus safe HTML for email delivery."""
+    plain = _strip_email_scratch(body or "")
+    return plain, _markdown_to_email_html(plain)
+
+
+def _attach_body_parts(msg: MIMEMultipart, body: str, *, html_enabled: bool) -> None:
+    """Attach email body with a plain fallback and optional HTML alternative."""
+    plain, html_body = _prepare_email_bodies(body)
+    if html_enabled:
+        alternative = MIMEMultipart("alternative")
+        alternative.attach(MIMEText(plain, "plain", "utf-8"))
+        alternative.attach(MIMEText(html_body, "html", "utf-8"))
+        msg.attach(alternative)
+    else:
+        msg.attach(MIMEText(plain, "plain", "utf-8"))
+
 
 def _send_imap_id(imap: "imaplib.IMAP4") -> None:
     """Send RFC 2971 IMAP ID command identifying this client.
@@ -459,6 +574,9 @@ class EmailAdapter(BasePlatformAdapter):
         self._from_address = (extra.get("from_address") or self._login_address).strip()
         self._reply_to_address = (extra.get("reply_to_address") or self._from_address).strip()
         self._resend_api_key_path = (extra.get("resend_api_key_path") or "").strip()
+        self._email_format = str(extra.get("format", "html") or "html").strip().lower()
+        if self._email_format not in {"html", "plain"}:
+            self._email_format = "html"
 
         # Skip attachments — configured via config.yaml:
         #   platforms:
@@ -545,14 +663,17 @@ class EmailAdapter(BasePlatformAdapter):
         attachments: Optional[List[Tuple[str, bytes]]] = None,
     ) -> str:
         msg_id = headers.get("Message-ID") or f"<hermes-{uuid.uuid4().hex[:12]}@{self._from_address.split('@')[1]}>"
+        text_body, html_body = _prepare_email_bodies(body)
         payload: Dict[str, Any] = {
             "from": self._from_address,
             "to": [to_addr],
             "subject": subject,
-            "text": body,
+            "text": text_body,
             "reply_to": self._reply_to_address,
             "headers": headers,
         }
+        if self._email_format == "html":
+            payload["html"] = html_body
         if attachments:
             payload["attachments"] = [
                 {
@@ -1044,7 +1165,7 @@ class EmailAdapter(BasePlatformAdapter):
         if self._reply_to_address:
             msg["Reply-To"] = self._reply_to_address
 
-        msg.attach(MIMEText(body, "plain", "utf-8"))
+        _attach_body_parts(msg, body, html_enabled=self._email_format == "html")
 
         smtp = self._connect_smtp()
         try:
@@ -1167,7 +1288,7 @@ class EmailAdapter(BasePlatformAdapter):
             msg["Reply-To"] = self._reply_to_address
 
         if body:
-            msg.attach(MIMEText(body, "plain", "utf-8"))
+            _attach_body_parts(msg, body, html_enabled=self._email_format == "html")
 
         for file_path in file_paths:
             p = Path(file_path)
@@ -1251,7 +1372,7 @@ class EmailAdapter(BasePlatformAdapter):
             msg["Reply-To"] = self._reply_to_address
 
         if body:
-            msg.attach(MIMEText(body, "plain", "utf-8"))
+            _attach_body_parts(msg, body, html_enabled=self._email_format == "html")
 
         # Attach file
         with open(p, "rb") as f:
@@ -1309,7 +1430,6 @@ async def _standalone_send(
     standalone_sender_fn contract; replaces the legacy _send_email helper."""
     import smtplib
     import ssl as _ssl
-    from email.mime.text import MIMEText
     from email.utils import formatdate
 
     extra = getattr(pconfig, "extra", {}) or {}
@@ -1325,11 +1445,13 @@ async def _standalone_send(
         return {"error": "Email not configured (EMAIL_ADDRESS, EMAIL_PASSWORD, EMAIL_SMTP_HOST required)"}
 
     try:
-        msg = MIMEText(message, "plain", "utf-8")
+        msg = MIMEMultipart()
         msg["From"] = address
         msg["To"] = chat_id
         msg["Subject"] = "Hermes Agent"
         msg["Date"] = formatdate(localtime=True)
+        email_format = str(extra.get("format", "html") or "html").strip().lower()
+        _attach_body_parts(msg, message, html_enabled=email_format != "plain")
 
         server = smtplib.SMTP(smtp_host, smtp_port)
         server.starttls(context=_ssl.create_default_context())
