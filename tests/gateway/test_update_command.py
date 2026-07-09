@@ -285,6 +285,52 @@ class TestHandleUpdateCommand:
         assert "Starting Hermes update" in result
 
     @pytest.mark.asyncio
+    async def test_uses_local_live_wrapper_when_applyability_allows_it(self, tmp_path):
+        """local/live runtimes should spawn hermes-local-update, not plain hermes update."""
+        runner = _make_runner()
+        event = _make_event()
+
+        fake_root = tmp_path / "project"
+        fake_root.mkdir()
+        (fake_root / ".git").mkdir()
+        (fake_root / "gateway").mkdir()
+        (fake_root / "gateway" / "run.py").touch()
+        fake_file = str(fake_root / "gateway" / "run.py")
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+
+        mock_popen = MagicMock()
+        with patch("gateway.run._hermes_home", hermes_home), \
+             patch("gateway.run.__file__", fake_file), \
+             patch("shutil.which", side_effect=lambda x: f"/usr/bin/{x}"), \
+             patch(
+                 "hermes_cli.web_server._git_update_applyability",
+                 return_value={
+                     "can_apply": True,
+                     "branch": "local/live",
+                     "target_branch": "main",
+                     "ahead": 5,
+                     "dirty": False,
+                     "dirty_entries": 0,
+                     "reason": "local_live_update",
+                     "message": "Use hermes-local-update for the local/live runtime branch.",
+                     "update_command": "hermes-local-update",
+                     "spawn_mode": "external",
+                     "spawn_command": ["/home/alex/.local/bin/hermes-local-update"],
+                 },
+             ), \
+             patch("subprocess.Popen", mock_popen):
+            result = await runner._handle_update_command(event)
+
+        call_args = mock_popen.call_args[0][0]
+        assert call_args[0] == "/usr/bin/setsid"
+        assert call_args[1] == "bash"
+        command_str = call_args[3]
+        assert "/home/alex/.local/bin/hermes-local-update" in command_str
+        assert " update --gateway" not in command_str
+        assert "Starting Hermes update" in result
+
+    @pytest.mark.asyncio
     async def test_fallback_when_no_setsid(self, tmp_path):
         """Falls back to start_new_session=True when setsid is not available."""
         runner = _make_runner()

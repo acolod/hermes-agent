@@ -4654,6 +4654,18 @@ class GatewaySlashCommandsMixin:
         if not hermes_cmd:
             return t("gateway.update.hermes_cmd_not_found")
 
+        update_argv = [*hermes_cmd, "update", "--gateway"]
+        try:
+            from hermes_cli.web_server import _git_update_applyability
+
+            applyability = _git_update_applyability()
+            spawn_mode = applyability.get("spawn_mode")
+            spawn_command = applyability.get("spawn_command")
+            if spawn_mode == "external" and isinstance(spawn_command, list) and spawn_command:
+                update_argv = [str(part) for part in spawn_command]
+        except Exception:
+            pass
+
         pending_path = _hermes_home / ".update_pending.json"
         output_path = _hermes_home / ".update_output.txt"
         exit_code_path = _hermes_home / ".update_exit_code"
@@ -4725,16 +4737,16 @@ class GatewaySlashCommandsMixin:
                     [
                         sys.executable, "-c", helper,
                         str(output_path), str(exit_code_path),
-                        *hermes_cmd, "update", "--gateway",
+                        *update_argv,
                     ],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     **windows_detach_popen_kwargs(),
                 )
             else:
-                hermes_cmd_str = " ".join(shlex.quote(part) for part in hermes_cmd)
+                update_cmd_str = " ".join(shlex.quote(part) for part in update_argv)
                 update_cmd = (
-                    f"PYTHONUNBUFFERED=1 {hermes_cmd_str} update --gateway"
+                    f"PYTHONUNBUFFERED=1 {update_cmd_str}"
                     f" > {shlex.quote(str(output_path))} 2>&1; "
                     # Avoid `status=$?`: `status` is a read-only special parameter
                     # in zsh, and this command string is copied/reused in macOS/zsh
