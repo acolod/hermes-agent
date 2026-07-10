@@ -170,6 +170,12 @@ npx tsc -b
 Use `~/.local/bin/hermes-local-update` to refresh `main`, rebase `local/live`,
 and report the live carry layer after updates.
 
+When update behavior fails through the WebUI or dashboard, the current
+cross-repo operator runbook lives at `/home/alex/hermes-webui/LOCAL_CARRY_NOTES.md`.
+That file names the live WebUI update entrypoints (`api/updates.py`,
+`api/gateway_restart.py`, `api/routes.py`, `static/ui.js`) and the exact
+inspection commands to run before assuming a generic git-divergence problem.
+
 The persistence contract is:
 - the runtime should normally run from `local/live`, not `main`
 - local carries that must survive updates should be cherry-picked onto
