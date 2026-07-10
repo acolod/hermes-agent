@@ -546,6 +546,28 @@ _TEST_PATTERNS = ("test_", "tmp_")
 _TEST_SUFFIXES = (".test.py", ".test.js", ".test.ts", ".test.md")
 
 
+def _is_git_worktree_path(path: Path, hermes_home: Path) -> bool:
+    """Return True when *path* belongs to a Git worktree under Hermes home.
+
+    Source tests in a project repository are durable project inputs, not
+    ephemeral agent test scripts.  Worktrees may use either a `.git` directory
+    or a `.git` file that points at the common Git directory.
+    """
+    try:
+        current = path.resolve()
+    except OSError:
+        return False
+    if not current.is_dir():
+        current = current.parent
+    while True:
+        marker = current / ".git"
+        if marker.is_dir() or marker.is_file():
+            return True
+        if current == hermes_home or current.parent == current:
+            return False
+        current = current.parent
+
+
 def guess_category(path: Path) -> Optional[str]:
     """Return a category label for *path*, or None if we shouldn't track it.
 
@@ -556,6 +578,8 @@ def guess_category(path: Path) -> Optional[str]:
 
     # Skip the state dir itself, logs, memory files, sessions, config.
     hermes_home = get_hermes_home()
+    if _is_git_worktree_path(path, hermes_home):
+        return None
     try:
         rel = path.resolve().relative_to(hermes_home)
         top = rel.parts[0] if rel.parts else ""
