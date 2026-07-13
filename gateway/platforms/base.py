@@ -2287,6 +2287,13 @@ class BasePlatformAdapter(ABC):
     # set this to False to stay correct-by-default.
     supports_async_delivery: bool = True
 
+    # Whether the adapter may receive messages that are not a response to a
+    # currently bound inbound request (gateway lifecycle, home-channel pushes,
+    # cron broadcasts, background status, etc.). Persistent chat transports
+    # support this by default. Request-scoped transports such as email override
+    # it to False and enforce a narrower purpose contract in send().
+    supports_unsolicited_delivery: bool = True
+
     # Whether this adapter's ``send()`` splits long content into multiple
     # messages via ``truncate_message()``.  When True, the delivery router
     # (gateway/delivery.py) skips gateway-level truncation and lets the
@@ -4088,6 +4095,10 @@ class BasePlatformAdapter(ABC):
         know to retry rather than waiting indefinitely.
         """
 
+        if self.platform == Platform.EMAIL and reply_to:
+            metadata = dict(metadata or {})
+            metadata.setdefault("email_purpose", "direct_reply")
+
         result = await self.send(
             chat_id=chat_id,
             content=content,
@@ -4948,6 +4959,9 @@ class BasePlatformAdapter(ABC):
                 # metadata stays unmarked and progress bubbles remain
                 # thread-strict.
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
+                if self.platform == Platform.EMAIL:
+                    _final_thread_metadata = dict(_final_thread_metadata or {})
+                    _final_thread_metadata["email_purpose"] = "direct_reply"
 
                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
                 # Gated via ``_should_auto_tts_for_chat``: fires when the chat has

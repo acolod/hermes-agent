@@ -815,7 +815,9 @@ class TestThreadContext(unittest.TestCase):
             mock_server = MagicMock()
             mock_smtp.return_value = mock_server
 
-            adapter._send_email("user@test.com", "Here is the answer.", None)
+            adapter._send_email(
+                "user@test.com", "Here is the answer.", "<original@test.com>"
+            )
 
             # Check the sent message
             send_call = mock_server.send_message.call_args[0][0]
@@ -836,14 +838,14 @@ class TestThreadContext(unittest.TestCase):
             mock_server = MagicMock()
             mock_smtp.return_value = mock_server
 
-            adapter._send_email("user@test.com", "Follow up.", None)
+            adapter._send_email("user@test.com", "Follow up.", "<reply@test.com>")
 
             send_call = mock_server.send_message.call_args[0][0]
             self.assertEqual(send_call["Subject"], "Re: Project question")
             self.assertFalse(send_call["Subject"].startswith("Re: Re:"))
 
     def test_no_thread_context_uses_default_subject(self):
-        """Without thread context, subject should be 'Re: Hermes Agent'."""
+        """A fresh explicit email must not masquerade as a reply thread."""
         adapter = self._make_adapter()
 
         with patch("smtplib.SMTP") as mock_smtp:
@@ -853,7 +855,7 @@ class TestThreadContext(unittest.TestCase):
             adapter._send_email("newuser@test.com", "Hello!", None)
 
             send_call = mock_server.send_message.call_args[0][0]
-            self.assertEqual(send_call["Subject"], "Re: Hermes Agent")
+            self.assertEqual(send_call["Subject"], "Hermes Agent")
             self.assertIn("Date", send_call)
 
 
@@ -1002,7 +1004,11 @@ class TestSendMethods(unittest.TestCase):
             mock_smtp.return_value = mock_server
 
             result = asyncio.run(
-                adapter.send("user@test.com", "Hello from Hermes!")
+                adapter.send(
+                    "user@test.com",
+                    "Hello from Hermes!",
+                    metadata={"email_purpose": "explicit_notification"},
+                )
             )
 
             self.assertTrue(result.success)
@@ -1020,7 +1026,11 @@ class TestSendMethods(unittest.TestCase):
             mock_smtp.side_effect = Exception("Connection refused")
 
             result = asyncio.run(
-                adapter.send("user@test.com", "Hello")
+                adapter.send(
+                    "user@test.com",
+                    "Hello",
+                    metadata={"email_purpose": "explicit_notification"},
+                )
             )
 
             self.assertFalse(result.success)

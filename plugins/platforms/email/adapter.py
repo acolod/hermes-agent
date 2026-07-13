@@ -39,6 +39,7 @@ from email import encoders
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from hermes_constants import get_hermes_home
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -489,6 +490,7 @@ def _email_domain(raw: str) -> str:
 def _extract_attachments(
     msg: email_lib.message.Message,
     skip_attachments: bool = False,
+    metadata_only: bool = False,
 ) -> List[Dict[str, Any]]:
     """Extract attachment metadata and cache files locally.
 
@@ -516,6 +518,17 @@ def _extract_attachments(
         else:
             ext = part.get_content_subtype() or "bin"
             filename = f"attachment.{ext}"
+
+        if metadata_only:
+            raw_payload = part.get_payload(decode=False)
+            raw_size = len(raw_payload) if isinstance(raw_payload, (str, bytes)) else None
+            attachments.append({
+                "filename": filename,
+                "type": "image" if Path(filename).suffix.lower() in _IMAGE_EXTS else "document",
+                "media_type": content_type,
+                "size": raw_size,
+            })
+            continue
 
         payload = part.get_payload(decode=True)
         if not payload:
@@ -548,6 +561,14 @@ def _extract_attachments(
 
 class EmailAdapter(BasePlatformAdapter):
     """Email gateway adapter using IMAP (receive) and SMTP (send)."""
+
+    supports_async_delivery: bool = False
+    supports_unsolicited_delivery: bool = False
+    _ALLOWED_EMAIL_PURPOSES = {
+        "direct_reply",
+        "explicit_review_packet",
+        "explicit_notification",
+    }
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.EMAIL)
@@ -617,8 +638,15 @@ class EmailAdapter(BasePlatformAdapter):
         self._seen_uids_max: int = 2000   # cap to prevent unbounded memory growth
         self._poll_task: Optional[asyncio.Task] = None
 
-        # Map chat_id (sender email) -> last subject + message-id for threading
+        # Request-scoped RFC thread metadata, keyed by the exact inbound
+        # Message-ID. The sender cache remains for compatibility but is never an
+        # implicit fallback for unrelated sends.
         self._thread_context: Dict[str, Dict[str, str]] = {}
+        self._thread_context_by_message_id: Dict[str, Dict[str, str]] = {}
+
+        # Authenticated Sam mail is handled by a dedicated no-session route.
+        # It is configured explicitly and remains outside EMAIL_ALLOWED_USERS.
+        self._sam_route = self._build_sam_restricted_route(extra)
 
         logger.info(
             "[Email] Adapter initialized (login=%s, from=%s, reply_to=%s, resend=%s)",
@@ -628,24 +656,133 @@ class EmailAdapter(BasePlatformAdapter):
             bool(self._resend_api_key_path),
         )
 
-    def _build_reply_subject(self, to_addr: str) -> str:
-        ctx = self._thread_context.get(to_addr, {})
-        subject = ctx.get("subject", "Hermes Agent")
-        if not subject.startswith("Re:"):
+    def _build_sam_restricted_route(self, extra: Dict[str, Any]):
+        if not bool(extra.get("sam_restricted_route_enabled", False)):
+            return None
+        from plugins.platforms.email.sam_restricted_route import SamRestrictedRoute
+
+        state_path = Path(str(
+            extra.get("sam_restricted_state_path")
+            or (get_hermes_home() / "email-intake" / "sam-restricted-state.json")
+        )).expanduser()
+        return SamRestrictedRoute(
+            state_path=state_path,
+            alex_email=str(
+                extra.get("sam_restricted_alex_email") or "alexcolodner@gmail.com"
+            ).strip(),
+            send_email=self._send_sam_route_email,
+            send_telegram=self._send_sam_route_telegram,
+            draft=self._draft_sam_restricted,
+        )
+
+    async def _send_sam_route_email(
+        self,
+        *,
+        to: str,
+        subject: str,
+        body: str,
+        purpose: str,
+        reply_to_message_id: Optional[str],
+        references: Optional[str],
+    ) -> str:
+        result = await self.send(
+            to,
+            body,
+            reply_to=reply_to_message_id,
+            metadata={
+                "email_purpose": purpose,
+                "email_subject": subject,
+                "email_references": references,
+            },
+        )
+        if not result.success:
+            raise RuntimeError(result.error or "restricted email delivery failed")
+        return str(result.message_id or "")
+
+    async def _send_sam_route_telegram(self, text: str) -> str:
+        chat_id = str(
+            (self.config.extra or {}).get("sam_restricted_telegram_chat_id") or ""
+        ).strip()
+        if not chat_id:
+            raise RuntimeError("sam_restricted_telegram_chat_id is not configured")
+        token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+        if not token:
+            raise RuntimeError("TELEGRAM_BOT_TOKEN is not configured")
+        from tools.send_message_tool import _send_telegram
+
+        result = await _send_telegram(token, chat_id, text)
+        if isinstance(result, dict) and result.get("success") is False:
+            raise RuntimeError(str(result.get("error") or "Telegram delivery failed"))
+        return str(result)
+
+    async def _draft_sam_restricted(self, packet: Dict[str, Any]) -> Dict[str, str]:
+        """Run one isolated no-tools/no-memory drafting turn."""
+        loop = asyncio.get_running_loop()
+
+        def _run() -> Dict[str, str]:
+            from run_agent import AIAgent
+            from plugins.platforms.email.sam_restricted_instruction import (
+                SAM_RESTRICTED_INSTRUCTION,
+            )
+
+            agent = AIAgent(
+                model="",
+                max_iterations=1,
+                enabled_toolsets=[],
+                skip_memory=True,
+                skip_context_files=True,
+                load_soul_identity=False,
+                ephemeral_system_prompt=SAM_RESTRICTED_INSTRUCTION,
+                quiet_mode=True,
+                verbose_logging=False,
+                platform="email-restricted",
+            )
+            try:
+                result = agent.run_conversation(
+                    json.dumps(packet, ensure_ascii=False),
+                    conversation_history=[],
+                )
+                raw = str((result or {}).get("final_response") or "").strip()
+                if raw.startswith("```"):
+                    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.I)
+                parsed = json.loads(raw)
+                return parsed if isinstance(parsed, dict) else {}
+            finally:
+                try:
+                    agent.close()
+                except Exception:
+                    pass
+
+        return await loop.run_in_executor(None, _run)
+
+    def _build_reply_subject(
+        self, to_addr: str, reply_to_msg_id: Optional[str] = None
+    ) -> str:
+        subject = "Hermes Agent"
+        if reply_to_msg_id:
+            ctx = self._thread_context_by_message_id.get(reply_to_msg_id, {})
+            if not ctx:
+                latest = self._thread_context.get(to_addr, {})
+                if latest.get("message_id") == reply_to_msg_id:
+                    ctx = latest
+            subject = ctx.get("subject", subject)
+        if not subject.lower().startswith("re:"):
             subject = f"Re: {subject}"
-        return subject
+        return subject if reply_to_msg_id else subject.removeprefix("Re: ")
 
     def _build_thread_headers(self, to_addr: str, reply_to_msg_id: Optional[str] = None) -> tuple[str, dict[str, str]]:
-        ctx = self._thread_context.get(to_addr, {})
         msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{_email_domain(self._from_address)}>"
         headers = {
             "Date": formatdate(localtime=True),
             "Message-ID": msg_id,
         }
-        original_msg_id = reply_to_msg_id or ctx.get("message_id")
-        if original_msg_id:
-            headers["In-Reply-To"] = original_msg_id
-            headers["References"] = original_msg_id
+        if reply_to_msg_id:
+            headers["In-Reply-To"] = reply_to_msg_id
+            ctx = self._thread_context_by_message_id.get(reply_to_msg_id, {})
+            references = str(ctx.get("references") or "").split()
+            if reply_to_msg_id not in references:
+                references.append(reply_to_msg_id)
+            headers["References"] = " ".join(references)
         return msg_id, headers
 
     def _read_resend_api_key(self) -> str:
@@ -923,6 +1060,7 @@ class EmailAdapter(BasePlatformAdapter):
                     subject = _decode_header_value(msg.get("Subject", "(no subject)"))
                     message_id = msg.get("Message-ID", "")
                     in_reply_to = msg.get("In-Reply-To", "")
+                    references = msg.get("References", "")
                     # Skip automated/noreply senders before any processing
                     msg_headers = dict(msg.items())
                     if _is_automated_sender(sender_addr, msg_headers):
@@ -940,7 +1078,11 @@ class EmailAdapter(BasePlatformAdapter):
                     )
 
                     body = _extract_text_body(msg)
-                    attachments = _extract_attachments(msg, skip_attachments=self._skip_attachments)
+                    attachments = _extract_attachments(
+                        msg,
+                        skip_attachments=self._skip_attachments,
+                        metadata_only=sender_addr.strip().lower() == "sammyphillips19@gmail.com",
+                    )
 
                     results.append({
                         "uid": uid,
@@ -949,6 +1091,7 @@ class EmailAdapter(BasePlatformAdapter):
                         "subject": subject,
                         "message_id": message_id,
                         "in_reply_to": in_reply_to,
+                        "references": references,
                         "body": body,
                         "attachments": attachments,
                         "date": msg.get("Date", ""),
@@ -994,9 +1137,52 @@ class EmailAdapter(BasePlatformAdapter):
             or os.getenv("GATEWAY_ALLOWED_USERS", "").strip()
         )
 
+    async def _maybe_handle_sam_receipt_command(self, msg_data: Dict[str, Any]) -> bool:
+        sender = str(msg_data.get("sender_addr") or "").strip().lower()
+        alex_email = str(
+            (self.config.extra or {}).get("sam_restricted_alex_email")
+            or "alexcolodner@gmail.com"
+        ).strip().lower()
+        if sender != alex_email or not bool(msg_data.get("sender_authenticated")):
+            return False
+        body = str(msg_data.get("body") or "").strip()
+        match = re.match(
+            r"^SAM\s+(APPROVE|DECLINE|EDIT)\s+(sam-[a-f0-9]{3,64})(?:\s*\n([\s\S]+))?$",
+            body,
+            re.IGNORECASE,
+        )
+        if not match:
+            return False
+        action, receipt_id, edited = match.groups()
+        route = self._sam_route
+        if action.upper() == "APPROVE":
+            result = await route.approve(receipt_id)
+        elif action.upper() == "DECLINE":
+            result = await route.decline(receipt_id)
+        else:
+            result = await route.edit(receipt_id, edited or "")
+        await self.send(
+            sender,
+            f"Sam receipt {receipt_id}: {result.get('status', 'unknown')}",
+            metadata={
+                "email_purpose": "explicit_notification",
+                "email_subject": f"Sam receipt {receipt_id}",
+            },
+        )
+        return True
+
     async def _dispatch_message(self, msg_data: Dict[str, Any]) -> None:
         """Convert a fetched email into a MessageEvent and dispatch it."""
         sender_addr = msg_data["sender_addr"]
+
+        # The restricted Sam route is intentionally consumed before the normal
+        # allowlist/session path. It never creates a reusable gateway session.
+        sam_route = getattr(self, "_sam_route", None)
+        if sam_route is not None and sender_addr.strip().lower() == "sammyphillips19@gmail.com":
+            if await sam_route.handle(msg_data):
+                return
+        if sam_route is not None and await self._maybe_handle_sam_receipt_command(msg_data):
+            return
 
         # Skip self-messages from either the login mailbox or the public alias.
         sender_addr_lc = sender_addr.lower()
@@ -1083,11 +1269,21 @@ class EmailAdapter(BasePlatformAdapter):
                 # only classification that surfaces both.
                 msg_type = MessageType.DOCUMENT
 
-        # Store thread context for reply threading
+        # Store request-scoped thread context under the exact RFC Message-ID.
+        inbound_message_id = str(msg_data.get("message_id") or "").strip()
         self._thread_context[sender_addr] = {
             "subject": subject,
-            "message_id": msg_data["message_id"],
+            "message_id": inbound_message_id,
         }
+        if inbound_message_id:
+            self._thread_context_by_message_id[inbound_message_id] = {
+                "subject": subject,
+                "references": str(msg_data.get("references") or ""),
+            }
+            if len(self._thread_context_by_message_id) > self._seen_uids_max:
+                self._thread_context_by_message_id.pop(
+                    next(iter(self._thread_context_by_message_id)), None
+                )
 
         source = self.build_source(
             chat_id=sender_addr,
@@ -1117,11 +1313,32 @@ class EmailAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Send an email reply to the given address."""
+        """Send one explicitly purposed request-scoped email."""
+        metadata = metadata or {}
+        purpose = str(metadata.get("email_purpose") or "").strip().lower()
+        if purpose not in self._ALLOWED_EMAIL_PURPOSES:
+            return SendResult(
+                success=False,
+                error="Email send rejected: explicit email_purpose is required",
+            )
+        if purpose == "direct_reply" and not reply_to:
+            return SendResult(
+                success=False,
+                error="Email direct_reply requires the triggering RFC Message-ID",
+            )
+        subject_override = metadata.get("email_subject")
+        references_override = metadata.get("email_references")
         try:
             loop = asyncio.get_running_loop()
             message_id = await loop.run_in_executor(
-                None, self._send_email, chat_id, content, reply_to
+                None,
+                self._send_email,
+                chat_id,
+                content,
+                reply_to,
+                subject_override,
+                purpose,
+                references_override,
             )
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
@@ -1143,10 +1360,15 @@ class EmailAdapter(BasePlatformAdapter):
         to_addr: str,
         body: str,
         reply_to_msg_id: Optional[str] = None,
+        subject_override: Optional[str] = None,
+        purpose: str = "direct_reply",
+        references_override: Optional[str] = None,
     ) -> str:
         """Send an email reply. Runs in executor thread."""
-        subject = self._build_reply_subject(to_addr)
+        subject = subject_override or self._build_reply_subject(to_addr, reply_to_msg_id)
         msg_id, headers = self._build_thread_headers(to_addr, reply_to_msg_id)
+        if reply_to_msg_id and references_override:
+            headers["References"] = str(references_override)
 
         if self._resend_api_key_path:
             return self._send_via_resend(

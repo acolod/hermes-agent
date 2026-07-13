@@ -5795,6 +5795,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 adapter = self.adapters.get(platform)
                 if not adapter:
                     continue
+                if not getattr(adapter, "supports_unsolicited_delivery", True):
+                    logger.info(
+                        "Shutdown notification suppressed for request-scoped adapter: %s",
+                        platform_str,
+                    )
+                    continue
 
                 platform_cfg = self.config.platforms.get(platform)
                 if platform_cfg is not None and not platform_cfg.gateway_restart_notification:
@@ -5881,6 +5887,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # ``RuntimeError: dictionary changed size during iteration`` —
         # observed in a user report during gateway shutdown.
         for platform, adapter in list(self.adapters.items()):
+            if not getattr(adapter, "supports_unsolicited_delivery", True):
+                continue
             home = self.config.get_home_channel(platform)
             if not home or not home.chat_id:
                 continue
@@ -14872,6 +14880,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         message = "♻️ Gateway online — Hermes is back and ready."
 
         for platform, adapter in self.adapters.items():
+            if not getattr(adapter, "supports_unsolicited_delivery", True):
+                continue
             home = self.config.get_home_channel(platform)
             if not home or not home.chat_id:
                 continue

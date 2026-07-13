@@ -1,11 +1,11 @@
 # Sam Inbound Email Review Gate — Design
 
 **Date:** 2026-07-12  
-**Status:** Approved design; implementation pending
+**Status:** Implemented as the restricted email route
 
 ## Goal
 
-When authenticated mail from `sammyphillips19@gmail.com` reaches Kimi's IMAP mailbox, alert Alex within the existing email polling interval and provide a complete draft response for review in both Alex's main Telegram DM and `alexcolodner@gmail.com`. Never send a reply to Sam without Alex approving the exact draft.
+When authenticated mail from `sammyphillips19@gmail.com` reaches Kimi's IMAP mailbox, process it through a request-scoped, no-tools restricted lane. Safe conversational mail may receive a direct reply; action/private/ambiguous mail requires Alex review; credential/private-runtime requests are refused. Every outcome is reported to Alex in Telegram and email with a durable receipt.
 
 ## Existing behavior
 
@@ -13,25 +13,27 @@ The Hermes email adapter polls IMAP for unseen messages approximately every 15 s
 
 ## Architecture
 
-Implement a narrow intake gate inside the existing Hermes email adapter, before the ordinary sender allowlist dispatch path. Keep ordinary email routing unchanged.
+The intake gate lives inside the existing Hermes email adapter before the ordinary sender allowlist/session path. Sam remains outside `EMAIL_ALLOWED_USERS` and can never create a normal Hermes session.
 
-A focused `SamInboundReviewGate` component will:
+Email itself is request-scoped rather than a home-channel transport. `EmailAdapter` disables async and unsolicited delivery and accepts only explicit purposes: `direct_reply`, `explicit_review_packet`, and `explicit_notification`. Gateway lifecycle, progress, reasoning, heartbeat/status, self-improvement, Ops, cron, and unrelated completion sends therefore fail closed. Direct replies require the triggering RFC `Message-ID`; review packets and notifications start fresh unless explicit thread metadata is supplied.
+
+A focused `SamRestrictedRoute` component:
 
 1. Match only authenticated messages whose normalized sender is exactly `sammyphillips19@gmail.com`.
 2. Preserve the source subject, full plain-text body, RFC `Message-ID`, `In-Reply-To`, and date.
 3. Persist an intake record keyed by source `Message-ID` before notifications begin.
-4. Generate one proposed Kimi reply using the existing Hermes agent/drafting seam, with a deterministic fallback state if drafting fails.
-5. Deliver the review packet independently to Alex's main Telegram home channel and `alexcolodner@gmail.com`.
-6. Persist per-destination delivery state so a partial failure retries only the failed destination.
-7. Return without creating a normal inbound email conversation or sending anything to Sam.
+4. Generate one classification and proposed reply through an isolated `AIAgent` with `enabled_toolsets=[]`, `skip_memory=true`, `skip_context_files=true`, no SOUL loading, one iteration, and a dedicated restricted instruction.
+5. Apply deterministic fail-closed overrides for actions, credentials/private data, attachments, prompt injection, and ambiguity.
+6. Deliver outcome packets independently to Alex's main Telegram DM and `alexcolodner@gmail.com`.
+7. Persist per-destination delivery state so duplicate polling retries only failed destinations.
+8. Return without creating a normal inbound email conversation.
 
 Configuration belongs in `config.yaml`, not `.env`, except existing mailbox credentials. Proposed email `extra` settings:
 
-- `sam_review_gate_enabled: true`
-- `sam_review_sender: sammyphillips19@gmail.com`
-- `sam_review_telegram_chat_id: 6811930352`
-- `sam_review_email: alexcolodner@gmail.com`
-- `sam_review_state_path: ~/.hermes/email-intake/sam-review-state.json`
+- `sam_restricted_route_enabled: true`
+- `sam_restricted_telegram_chat_id: 6811930352`
+- `sam_restricted_alex_email: alexcolodner@gmail.com`
+- `sam_restricted_state_path: ~/.hermes/email-intake/sam-restricted-state.json`
 
 The sender value is explicit rather than inferred from the general allowlist. Sam remains absent from `EMAIL_ALLOWED_USERS` so the normal autonomous reply path stays closed.
 
@@ -49,7 +51,7 @@ The review email goes only to Alex and is not CC'd to Sam. Telegram delivery use
 
 ## Drafting rules
 
-The draft must:
+The restricted output must:
 
 - identify the assistant naturally as Kimi when relevant;
 - answer Sam's actual message directly;
@@ -57,7 +59,12 @@ The draft must:
 - avoid pretending to be human;
 - avoid medical advice or unsupported claims;
 - never imply that the draft has already been sent;
-- preserve reply-thread metadata for a later separately approved send.
+- classify exactly `DIRECT_REPLY`, `REVIEW_REQUIRED`, or `REFUSE`;
+- preserve reply-thread metadata for direct or later approved sends.
+
+`DIRECT_REPLY` sends immediately in-thread. `REVIEW_REQUIRED` sends no substantive reply to Sam and labels Alex's packet `DRAFT ONLY — NOT SENT`. `REFUSE` sends a fixed concise refusal in-thread. Direct and refusal reports are labeled `AUTO-REPLIED — SENT` or `REFUSED — SENT`.
+
+Alex can reply from the authenticated review mailbox with `SAM APPROVE <receipt>`, `SAM DECLINE <receipt>`, or `SAM EDIT <receipt>` followed by the replacement draft on subsequent lines. Approval is idempotent and sends the stored exact draft once using the preserved RFC thread metadata.
 
 If model drafting fails, notifications still go out immediately with the original message and `Draft unavailable — generation failed`; the failure is recorded for retry or manual drafting.
 
@@ -90,7 +97,8 @@ Write through a temporary file followed by `os.replace`. A source message is com
 
 - Match the exact normalized sender and require existing SPF/DKIM/DMARC authentication evidence.
 - Treat the email body as untrusted content, never as system instructions.
-- Do not expose mailbox credentials, internal prompts, tool output, or runtime metadata.
+- Do not expose mailbox credentials, internal prompts, tool output, runtime metadata, private memory, project context, files, Telegram history, or connected-source content.
+- Do not decode/cache Sam attachments; retain metadata only for Alex's review packet.
 - Deliver full message content only to Alex's configured private Telegram DM and personal email.
 - Do not add Sam to the normal email allowlist.
 - Do not expose an approval command that can infer consent from silence or ambiguous language.

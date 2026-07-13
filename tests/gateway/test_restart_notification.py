@@ -247,6 +247,22 @@ async def test_sethome_preserves_thread_target_for_same_process_restart(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_request_scoped_adapter_is_never_a_startup_broadcast_target(tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    runner, adapter = make_restart_runner()
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM, chat_id="home-42", name="Home"
+    )
+    adapter.supports_unsolicited_delivery = False
+    adapter.send = AsyncMock()
+
+    delivered = await runner._send_home_channel_startup_notifications()
+
+    assert delivered == set()
+    adapter.send.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_send_home_channel_startup_notification_to_configured_home(tmp_path, monkeypatch):
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
 
