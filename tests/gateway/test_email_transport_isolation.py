@@ -221,3 +221,102 @@ async def test_sam_drafter_constructs_no_tools_no_memory_agent():
     assert captured["skip_context_files"] is True
     assert captured["load_soul_identity"] is False
     assert captured["max_iterations"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '```json\n{"outcome":"DIRECT_REPLY","reply":"Hello","reason":"Safe"}\n```',
+        'Here is the result:\n{"outcome":"DIRECT_REPLY","reply":"Hello","reason":"Safe"}\nDone.',
+    ],
+)
+async def test_sam_drafter_accepts_one_wrapped_json_object(raw):
+    adapter = make_adapter()
+
+    class FakeAgent:
+        def __init__(self, **_kwargs):
+            pass
+
+        def run_conversation(self, *_args, **_kwargs):
+            return {"final_response": raw}
+
+        def close(self):
+            pass
+
+    with patch("run_agent.AIAgent", FakeAgent):
+        result = await adapter._draft_sam_restricted({"body": "What is your role?"})
+
+    assert result == {"outcome": "DIRECT_REPLY", "reply": "Hello", "reason": "Safe"}
+
+
+@pytest.mark.asyncio
+async def test_sam_drafter_repairs_malformed_json_once():
+    adapter = make_adapter()
+    responses = iter([
+        "{not valid json}",
+        '{"outcome":"DIRECT_REPLY","reply":"Hello","reason":"Safe"}',
+    ])
+    calls = []
+
+    class FakeAgent:
+        def __init__(self, **_kwargs):
+            pass
+
+        def run_conversation(self, prompt, **_kwargs):
+            calls.append(prompt)
+            return {"final_response": next(responses)}
+
+        def close(self):
+            pass
+
+    with patch("run_agent.AIAgent", FakeAgent):
+        result = await adapter._draft_sam_restricted({"body": "What is your role?"})
+
+    assert result["outcome"] == "DIRECT_REPLY"
+    assert len(calls) == 2
+    assert "previous output was invalid" in calls[1].lower()
+
+
+@pytest.mark.asyncio
+async def test_sam_drafter_unrecoverable_malformed_output_fails_closed():
+    adapter = make_adapter()
+    calls = []
+
+    class FakeAgent:
+        def __init__(self, **_kwargs):
+            pass
+
+        def run_conversation(self, prompt, **_kwargs):
+            calls.append(prompt)
+            return {"final_response": "<html>provider failure</html>"}
+
+        def close(self):
+            pass
+
+    with patch("run_agent.AIAgent", FakeAgent):
+        with pytest.raises(ValueError, match="structured output"):
+            await adapter._draft_sam_restricted({"body": "Tell me something ambiguous"})
+
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_sam_drafter_rejects_empty_direct_reply():
+    adapter = make_adapter()
+
+    class FakeAgent:
+        def __init__(self, **_kwargs):
+            pass
+
+        def run_conversation(self, *_args, **_kwargs):
+            return {
+                "final_response": '{"outcome":"DIRECT_REPLY","reply":"","reason":"Safe"}'
+            }
+
+        def close(self):
+            pass
+
+    with patch("run_agent.AIAgent", FakeAgent):
+        with pytest.raises(ValueError, match="structured output"):
+            await adapter._draft_sam_restricted({"body": "What is your role?"})

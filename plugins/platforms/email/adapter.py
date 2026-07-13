@@ -17,6 +17,7 @@ Environment variables:
 
 import asyncio
 import email as email_lib
+import hashlib
 import html
 import imaplib
 import json
@@ -52,6 +53,37 @@ from gateway.config import Platform, PlatformConfig
 from utils import env_int, env_bool
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_sam_structured_output(raw: str) -> Dict[str, str]:
+    """Extract and validate exactly one restricted Sam result object."""
+    text = str(raw or "").strip()
+    decoder = json.JSONDecoder()
+    candidates = []
+    for index, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            value, _end = decoder.raw_decode(text, index)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            candidates.append(value)
+    if len(candidates) != 1:
+        raise ValueError("invalid Sam structured output: expected exactly one JSON object")
+    parsed = candidates[0]
+    if set(parsed) != {"outcome", "reply", "reason"}:
+        raise ValueError("invalid Sam structured output: schema mismatch")
+    if not all(isinstance(parsed[key], str) for key in parsed):
+        raise ValueError("invalid Sam structured output: fields must be strings")
+    outcome = parsed["outcome"].strip().upper()
+    reply = parsed["reply"].strip()
+    reason = parsed["reason"].strip()
+    if outcome not in {"DIRECT_REPLY", "REVIEW_REQUIRED", "REFUSE"}:
+        raise ValueError("invalid Sam structured output: invalid outcome")
+    if not reason or (outcome == "DIRECT_REPLY" and not reply):
+        raise ValueError("invalid Sam structured output: required field is empty")
+    return {"outcome": outcome, "reply": reply, "reason": reason}
 # Automated sender patterns — emails from these are silently ignored
 _NOREPLY_PATTERNS = (
     "noreply", "no-reply", "no_reply", "donotreply", "do-not-reply",
@@ -716,7 +748,7 @@ class EmailAdapter(BasePlatformAdapter):
         return str(result)
 
     async def _draft_sam_restricted(self, packet: Dict[str, Any]) -> Dict[str, str]:
-        """Run one isolated no-tools/no-memory drafting turn."""
+        """Run one isolated no-tools/no-memory drafting turn plus one repair."""
         loop = asyncio.get_running_loop()
 
         def _run() -> Dict[str, str]:
@@ -738,15 +770,40 @@ class EmailAdapter(BasePlatformAdapter):
                 platform="email-restricted",
             )
             try:
-                result = agent.run_conversation(
-                    json.dumps(packet, ensure_ascii=False),
-                    conversation_history=[],
-                )
+                prompt = json.dumps(packet, ensure_ascii=False)
+                result = agent.run_conversation(prompt, conversation_history=[])
                 raw = str((result or {}).get("final_response") or "").strip()
-                if raw.startswith("```"):
-                    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.I)
-                parsed = json.loads(raw)
-                return parsed if isinstance(parsed, dict) else {}
+                try:
+                    return _parse_sam_structured_output(raw)
+                except ValueError:
+                    kind = "html" if raw.lstrip().lower().startswith("<html") else "malformed"
+                    logger.warning(
+                        "[Email] Restricted Sam draft output invalid; kind=%s bytes=%d sha256=%s; attempting one repair",
+                        kind,
+                        len(raw.encode("utf-8")),
+                        hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16],
+                    )
+                    repair_prompt = json.dumps(
+                        {
+                            "task": (
+                                "The previous output was invalid. Return exactly one corrected JSON object "
+                                "with only string fields outcome, reply, reason. outcome must be "
+                                "DIRECT_REPLY, REVIEW_REQUIRED, or REFUSE. DIRECT_REPLY requires a "
+                                "nonempty reply. Do not include markdown or prose."
+                            ),
+                            "packet": packet,
+                            "invalid_output": raw[:4000],
+                        },
+                        ensure_ascii=False,
+                    )
+                    repaired = agent.run_conversation(repair_prompt, conversation_history=[])
+                    repaired_raw = str((repaired or {}).get("final_response") or "").strip()
+                    try:
+                        return _parse_sam_structured_output(repaired_raw)
+                    except ValueError as repair_error:
+                        raise ValueError(
+                            "invalid Sam structured output after one repair"
+                        ) from repair_error
             finally:
                 try:
                     agent.close()
