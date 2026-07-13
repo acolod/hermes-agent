@@ -55,8 +55,7 @@ from utils import env_int, env_bool
 logger = logging.getLogger(__name__)
 
 
-def _parse_sam_structured_output(raw: str) -> Dict[str, str]:
-    """Extract and validate exactly one restricted Sam result object."""
+def _extract_one_json_object(raw: str) -> Dict[str, Any]:
     text = str(raw or "").strip()
     decoder = json.JSONDecoder()
     candidates = []
@@ -71,19 +70,89 @@ def _parse_sam_structured_output(raw: str) -> Dict[str, str]:
             candidates.append(value)
     if len(candidates) != 1:
         raise ValueError("invalid Sam structured output: expected exactly one JSON object")
-    parsed = candidates[0]
-    if set(parsed) != {"outcome", "reply", "reason"}:
+    return candidates[0]
+
+
+def _parse_sam_structured_output(raw: str) -> Dict[str, str]:
+    """Extract and validate exactly one restricted Sam draft object."""
+    parsed = _extract_one_json_object(raw)
+    required = {
+        "outcome",
+        "informational_content",
+        "reason",
+        "proposed_action_verb",
+        "proposed_action_object",
+        "proposed_action_target",
+        "required_authority",
+    }
+    if set(parsed) != required:
         raise ValueError("invalid Sam structured output: schema mismatch")
     if not all(isinstance(parsed[key], str) for key in parsed):
         raise ValueError("invalid Sam structured output: fields must be strings")
     outcome = parsed["outcome"].strip().upper()
-    reply = parsed["reply"].strip()
+    informational_content = parsed["informational_content"].strip()
     reason = parsed["reason"].strip()
-    if outcome not in {"DIRECT_REPLY", "REVIEW_REQUIRED", "REFUSE"}:
+    if outcome not in {
+        "DIRECT_REPLY",
+        "SEND_AND_REVIEW_ACTION",
+        "REVIEW_REQUIRED",
+        "REFUSE",
+    }:
         raise ValueError("invalid Sam structured output: invalid outcome")
-    if not reason or (outcome == "DIRECT_REPLY" and not reply):
+    if not reason or (
+        outcome in {"DIRECT_REPLY", "SEND_AND_REVIEW_ACTION"} and not informational_content
+    ):
         raise ValueError("invalid Sam structured output: required field is empty")
-    return {"outcome": outcome, "reply": reply, "reason": reason}
+    verb = parsed["proposed_action_verb"].strip()
+    obj = parsed["proposed_action_object"].strip()
+    target = parsed["proposed_action_target"].strip()
+    authority = parsed["required_authority"].strip()
+    if outcome == "SEND_AND_REVIEW_ACTION" and not all((verb, obj, target, authority)):
+        raise ValueError("invalid Sam structured output: action fields are empty")
+    return {
+        "outcome": outcome,
+        "informational_content": informational_content,
+        "reason": reason,
+        "proposed_action_verb": verb,
+        "proposed_action_object": obj,
+        "proposed_action_target": target,
+        "required_authority": authority,
+    }
+
+
+def _parse_sam_validation_output(raw: str) -> Dict[str, str]:
+    """Extract and validate exactly one restricted Sam validation object."""
+    parsed = _extract_one_json_object(raw)
+    required = {"verdict", "validation_marker", "reason", "effect"}
+    if set(parsed) != required:
+        raise ValueError("invalid Sam validation output: schema mismatch")
+    if not all(isinstance(parsed[key], str) for key in parsed):
+        raise ValueError("invalid Sam validation output: fields must be strings")
+    verdict = parsed["verdict"].strip().upper()
+    marker = parsed["validation_marker"].strip()
+    reason = parsed["reason"].strip()
+    effect = parsed["effect"].strip().upper()
+    if verdict not in {"PASS", "FAIL"}:
+        raise ValueError("invalid Sam validation output: invalid verdict")
+    if not reason:
+        raise ValueError("invalid Sam validation output: required field is empty")
+    if effect not in {
+        "INFORMATIONAL",
+        "PROTECTED_ACTION",
+        "PRIVATE_DISCLOSURE",
+        "REFUSAL",
+    }:
+        raise ValueError("invalid Sam validation output: invalid effect")
+    if verdict == "PASS" and marker != "SAM_RESTRICTED_VALIDATED_V1":
+        raise ValueError("invalid Sam validation output: missing validation marker")
+    if verdict == "FAIL" and marker:
+        raise ValueError("invalid Sam validation output: unexpected validation marker")
+    return {
+        "verdict": verdict,
+        "validation_marker": marker,
+        "reason": reason,
+        "effect": effect,
+    }
 # Automated sender patterns — emails from these are silently ignored
 _NOREPLY_PATTERNS = (
     "noreply", "no-reply", "no_reply", "donotreply", "do-not-reply",
@@ -699,6 +768,11 @@ class EmailAdapter(BasePlatformAdapter):
         )).expanduser()
         return SamRestrictedRoute(
             state_path=state_path,
+            shared_context_path=Path(str(
+                extra.get("sam_shared_context_path")
+                or (get_hermes_home() / "shared-context" / "sam-household.json")
+            )).expanduser(),
+            shared_context_root=get_hermes_home() / "shared-context",
             alex_email=str(
                 extra.get("sam_restricted_alex_email") or "alexcolodner@gmail.com"
             ).strip(),
@@ -716,7 +790,11 @@ class EmailAdapter(BasePlatformAdapter):
         purpose: str,
         reply_to_message_id: Optional[str],
         references: Optional[str],
+        idempotency_key: str,
     ) -> str:
+        if not self._resend_api_key_path:
+            raise RuntimeError("restricted Sam delivery requires provider idempotency")
+        delivery_key = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()[:32]
         result = await self.send(
             to,
             body,
@@ -725,6 +803,8 @@ class EmailAdapter(BasePlatformAdapter):
                 "email_purpose": purpose,
                 "email_subject": subject,
                 "email_references": references,
+                "email_idempotency_key": delivery_key,
+                "email_message_id": f"<email-{delivery_key}@{_email_domain(self._from_address)}>",
             },
         )
         if not result.success:
@@ -748,67 +828,136 @@ class EmailAdapter(BasePlatformAdapter):
         return str(result)
 
     async def _draft_sam_restricted(self, packet: Dict[str, Any]) -> Dict[str, str]:
-        """Run one isolated no-tools/no-memory drafting turn plus one repair."""
+        """Run isolated no-tools/no-memory draft and semantic validation turns."""
         loop = asyncio.get_running_loop()
 
         def _run() -> Dict[str, str]:
             from run_agent import AIAgent
             from plugins.platforms.email.sam_restricted_instruction import (
-                SAM_RESTRICTED_INSTRUCTION,
+                SAM_RESTRICTED_DRAFT_INSTRUCTION,
+                SAM_RESTRICTED_VALIDATION_INSTRUCTION,
             )
 
-            agent = AIAgent(
-                model="",
-                max_iterations=1,
-                enabled_toolsets=[],
-                skip_memory=True,
-                skip_context_files=True,
-                load_soul_identity=False,
-                ephemeral_system_prompt=SAM_RESTRICTED_INSTRUCTION,
-                quiet_mode=True,
-                verbose_logging=False,
-                platform="email-restricted",
-            )
-            try:
-                prompt = json.dumps(packet, ensure_ascii=False)
-                result = agent.run_conversation(prompt, conversation_history=[])
-                raw = str((result or {}).get("final_response") or "").strip()
+            def _make_agent(system_prompt: str) -> Any:
+                return AIAgent(
+                    provider=str(
+                        (self.config.extra or {}).get("sam_restricted_provider")
+                        or "openai-codex"
+                    ),
+                    model=str(
+                        (self.config.extra or {}).get("sam_restricted_model")
+                        or "gpt-5.6-sol"
+                    ),
+                    fallback_model={
+                        "provider": str(
+                            (self.config.extra or {}).get("sam_restricted_fallback_provider")
+                            or "modelrelay"
+                        ),
+                        "model": str(
+                            (self.config.extra or {}).get("sam_restricted_fallback_model")
+                            or "qwen3-32b"
+                        ),
+                    },
+                    max_iterations=1,
+                    enabled_toolsets=[],
+                    skip_memory=True,
+                    skip_context_files=True,
+                    load_soul_identity=False,
+                    ephemeral_system_prompt=system_prompt,
+                    quiet_mode=True,
+                    verbose_logging=False,
+                    platform="email-restricted",
+                )
+
+            def _draft_once() -> Dict[str, str]:
+                agent = _make_agent(SAM_RESTRICTED_DRAFT_INSTRUCTION)
                 try:
-                    return _parse_sam_structured_output(raw)
-                except ValueError:
-                    kind = "html" if raw.lstrip().lower().startswith("<html") else "malformed"
-                    logger.warning(
-                        "[Email] Restricted Sam draft output invalid; kind=%s bytes=%d sha256=%s; attempting one repair",
-                        kind,
-                        len(raw.encode("utf-8")),
-                        hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16],
-                    )
-                    repair_prompt = json.dumps(
+                    prompt = json.dumps(packet, ensure_ascii=False)
+                    result = agent.run_conversation(prompt, conversation_history=[])
+                    raw = str((result or {}).get("final_response") or "").strip()
+                    try:
+                        return _parse_sam_structured_output(raw)
+                    except ValueError:
+                        kind = "html" if raw.lstrip().lower().startswith("<html") else "malformed"
+                        logger.warning(
+                            "[Email] Restricted Sam draft output invalid; kind=%s bytes=%d sha256=%s; attempting one repair",
+                            kind,
+                            len(raw.encode("utf-8")),
+                            hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16],
+                        )
+                        repair_prompt = json.dumps(
+                            {
+                                "task": (
+                                    "The previous output was invalid. Return exactly one corrected JSON object "
+                                    "with only string fields outcome, informational_content, reason, "
+                                    "proposed_action_verb, proposed_action_object, proposed_action_target, "
+                                    "required_authority. outcome must be DIRECT_REPLY, "
+                                    "SEND_AND_REVIEW_ACTION, REVIEW_REQUIRED, or REFUSE. DIRECT_REPLY and "
+                                    "SEND_AND_REVIEW_ACTION require nonempty informational_content. "
+                                    "SEND_AND_REVIEW_ACTION requires all four proposed action fields. "
+                                    "Do not include markdown or prose."
+                                ),
+                                "packet": packet,
+                                "invalid_output": raw[:4000],
+                            },
+                            ensure_ascii=False,
+                        )
+                        repaired = agent.run_conversation(repair_prompt, conversation_history=[])
+                        repaired_raw = str((repaired or {}).get("final_response") or "").strip()
+                        try:
+                            return _parse_sam_structured_output(repaired_raw)
+                        except ValueError as repair_error:
+                            raise ValueError(
+                                "invalid Sam structured output after one repair"
+                            ) from repair_error
+                finally:
+                    try:
+                        agent.close()
+                    except Exception:
+                        pass
+
+            def _validate_once(draft_result: Dict[str, str]) -> Dict[str, str]:
+                agent = _make_agent(SAM_RESTRICTED_VALIDATION_INSTRUCTION)
+                try:
+                    validation_prompt = json.dumps(
                         {
-                            "task": (
-                                "The previous output was invalid. Return exactly one corrected JSON object "
-                                "with only string fields outcome, reply, reason. outcome must be "
-                                "DIRECT_REPLY, REVIEW_REQUIRED, or REFUSE. DIRECT_REPLY requires a "
-                                "nonempty reply. Do not include markdown or prose."
-                            ),
-                            "packet": packet,
-                            "invalid_output": raw[:4000],
+                            "new_sam_message": str(packet.get("body") or ""),
+                            "draft_result": draft_result,
                         },
                         ensure_ascii=False,
                     )
-                    repaired = agent.run_conversation(repair_prompt, conversation_history=[])
-                    repaired_raw = str((repaired or {}).get("final_response") or "").strip()
+                    result = agent.run_conversation(validation_prompt, conversation_history=[])
+                    raw = str((result or {}).get("final_response") or "").strip()
+                    return _parse_sam_validation_output(raw)
+                finally:
                     try:
-                        return _parse_sam_structured_output(repaired_raw)
-                    except ValueError as repair_error:
-                        raise ValueError(
-                            "invalid Sam structured output after one repair"
-                        ) from repair_error
-            finally:
-                try:
-                    agent.close()
-                except Exception:
-                    pass
+                        agent.close()
+                    except Exception:
+                        pass
+
+            draft_result = _draft_once()
+            validation = _validate_once(draft_result)
+            allowed_effects = {
+                "DIRECT_REPLY": {"INFORMATIONAL"},
+                "SEND_AND_REVIEW_ACTION": {"PROTECTED_ACTION"},
+                "REVIEW_REQUIRED": {"PROTECTED_ACTION", "PRIVATE_DISCLOSURE"},
+                "REFUSE": {"REFUSAL"},
+            }
+            if (
+                validation["verdict"] == "PASS"
+                and validation["effect"] not in allowed_effects[draft_result["outcome"]]
+            ):
+                validation = {
+                    "verdict": "FAIL",
+                    "validation_marker": "",
+                    "reason": "validator effect does not match drafted outcome",
+                    "effect": validation["effect"],
+                }
+            merged = dict(draft_result)
+            merged["validation_marker"] = validation["validation_marker"]
+            merged["validation_reason"] = validation["reason"]
+            merged["validation_effect"] = validation["effect"]
+            return merged
 
         return await loop.run_in_executor(None, _run)
 
@@ -855,6 +1004,7 @@ class EmailAdapter(BasePlatformAdapter):
         body: str,
         headers: Dict[str, str],
         attachments: Optional[List[Tuple[str, bytes]]] = None,
+        idempotency_key: Optional[str] = None,
     ) -> str:
         msg_id = headers.get("Message-ID") or f"<hermes-{uuid.uuid4().hex[:12]}@{self._from_address.split('@')[1]}>"
         text_body, html_body = _prepare_email_bodies(body)
@@ -876,14 +1026,17 @@ class EmailAdapter(BasePlatformAdapter):
                 }
                 for filename, content in attachments
             ]
+        request_headers = {
+            "Authorization": f"Bearer {self._read_resend_api_key()}",
+            "Content-Type": "application/json",
+            "User-Agent": "Hermes-EmailAdapter/1.0",
+        }
+        if idempotency_key:
+            request_headers["Idempotency-Key"] = idempotency_key
         req = urllib.request.Request(
             "https://api.resend.com/emails",
             data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {self._read_resend_api_key()}",
-                "Content-Type": "application/json",
-                "User-Agent": "Hermes-EmailAdapter/1.0",
-            },
+            headers=request_headers,
             method="POST",
         )
         try:
@@ -1385,6 +1538,8 @@ class EmailAdapter(BasePlatformAdapter):
             )
         subject_override = metadata.get("email_subject")
         references_override = metadata.get("email_references")
+        idempotency_key = str(metadata.get("email_idempotency_key") or "").strip() or None
+        message_id_override = str(metadata.get("email_message_id") or "").strip() or None
         try:
             loop = asyncio.get_running_loop()
             message_id = await loop.run_in_executor(
@@ -1396,6 +1551,8 @@ class EmailAdapter(BasePlatformAdapter):
                 subject_override,
                 purpose,
                 references_override,
+                idempotency_key,
+                message_id_override,
             )
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
@@ -1420,10 +1577,15 @@ class EmailAdapter(BasePlatformAdapter):
         subject_override: Optional[str] = None,
         purpose: str = "direct_reply",
         references_override: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+        message_id_override: Optional[str] = None,
     ) -> str:
         """Send an email reply. Runs in executor thread."""
         subject = subject_override or self._build_reply_subject(to_addr, reply_to_msg_id)
         msg_id, headers = self._build_thread_headers(to_addr, reply_to_msg_id)
+        if message_id_override:
+            msg_id = message_id_override
+            headers["Message-ID"] = message_id_override
         if reply_to_msg_id and references_override:
             headers["References"] = str(references_override)
 
@@ -1433,6 +1595,7 @@ class EmailAdapter(BasePlatformAdapter):
                 subject=subject,
                 body=body,
                 headers=headers,
+                idempotency_key=idempotency_key,
             )
 
         msg = MIMEMultipart()

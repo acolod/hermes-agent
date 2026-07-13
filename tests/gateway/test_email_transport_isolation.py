@@ -19,6 +19,45 @@ def make_adapter():
         return EmailAdapter(PlatformConfig(enabled=True))
 
 
+def draft_result(
+    outcome,
+    informational_content,
+    reason,
+    *,
+    verb="",
+    obj="",
+    target="",
+    authority="",
+    marker="SAM_RESTRICTED_VALIDATED_V1",
+    effect=None,
+):
+    if effect is None:
+        effect = {
+            "DIRECT_REPLY": "INFORMATIONAL",
+            "SEND_AND_REVIEW_ACTION": "PROTECTED_ACTION",
+            "REVIEW_REQUIRED": "PRIVATE_DISCLOSURE",
+            "REFUSE": "REFUSAL",
+        }[outcome]
+    return (
+        "{"
+        f'"outcome":"{outcome}",'
+        f'"informational_content":"{informational_content}",'
+        f'"reason":"{reason}",'
+        f'"proposed_action_verb":"{verb}",'
+        f'"proposed_action_object":"{obj}",'
+        f'"proposed_action_target":"{target}",'
+        f'"required_authority":"{authority}"'
+        "}"
+    ), (
+        "{"
+        '"verdict":"PASS",'
+        f'"validation_marker":"{marker}",'
+        '"reason":"safe",'
+        f'"effect":"{effect}"'
+        "}"
+    )
+
+
 def test_email_declares_request_scoped_delivery_capabilities():
     adapter = make_adapter()
     assert adapter.supports_async_delivery is False
@@ -51,7 +90,14 @@ async def test_email_direct_reply_requires_and_uses_trigger_message_id():
     assert missing.success is False
     assert sent.success is True
     adapter._send_email.assert_called_once_with(
-        "alex@test.com", "reply", "<in@test.com>", None, "direct_reply", None
+        "alex@test.com",
+        "reply",
+        "<in@test.com>",
+        None,
+        "direct_reply",
+        None,
+        None,
+        None,
     )
 
 
@@ -92,7 +138,14 @@ async def test_explicit_review_packet_starts_fresh_even_with_stale_sender_cache(
     )
     assert result.success is True
     adapter._send_email.assert_called_once_with(
-        "alex@test.com", "review packet", None, "Sam review receipt", "explicit_review_packet", None
+        "alex@test.com",
+        "review packet",
+        None,
+        "Sam review receipt",
+        "explicit_review_packet",
+        None,
+        None,
+        None,
     )
 
 
@@ -199,15 +252,19 @@ async def test_alex_receipt_approval_command_is_consumed_without_normal_session(
 async def test_sam_drafter_constructs_no_tools_no_memory_agent():
     adapter = make_adapter()
     captured = {}
+    draft_raw, validation_raw = draft_result(
+        "REVIEW_REQUIRED",
+        "Draft",
+        "Review",
+    )
+    responses = iter([draft_raw, validation_raw])
 
     class FakeAgent:
         def __init__(self, **kwargs):
             captured.update(kwargs)
 
         def run_conversation(self, *_args, **_kwargs):
-            return {
-                "final_response": '{"outcome":"REVIEW_REQUIRED","reply":"Draft","reason":"Review"}'
-            }
+            return {"final_response": next(responses)}
 
         def close(self):
             return None
@@ -221,25 +278,33 @@ async def test_sam_drafter_constructs_no_tools_no_memory_agent():
     assert captured["skip_context_files"] is True
     assert captured["load_soul_identity"] is False
     assert captured["max_iterations"] == 1
+    assert captured["provider"] == "openai-codex"
+    assert captured["model"] == "gpt-5.6-sol"
+    assert captured["fallback_model"] == {
+        "provider": "modelrelay",
+        "model": "qwen3-32b",
+    }
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "raw",
     [
-        '```json\n{"outcome":"DIRECT_REPLY","reply":"Hello","reason":"Safe"}\n```',
-        'Here is the result:\n{"outcome":"DIRECT_REPLY","reply":"Hello","reason":"Safe"}\nDone.',
+        '```json\n{"outcome":"DIRECT_REPLY","informational_content":"Hello","reason":"Safe","proposed_action_verb":"","proposed_action_object":"","proposed_action_target":"","required_authority":""}\n```',
+        'Here is the result:\n{"outcome":"DIRECT_REPLY","informational_content":"Hello","reason":"Safe","proposed_action_verb":"","proposed_action_object":"","proposed_action_target":"","required_authority":""}\nDone.',
     ],
 )
 async def test_sam_drafter_accepts_one_wrapped_json_object(raw):
     adapter = make_adapter()
+    _draft_raw, validation_raw = draft_result("DIRECT_REPLY", "Hello", "Safe")
+    responses = iter([raw, validation_raw])
 
     class FakeAgent:
         def __init__(self, **_kwargs):
             pass
 
         def run_conversation(self, *_args, **_kwargs):
-            return {"final_response": raw}
+            return {"final_response": next(responses)}
 
         def close(self):
             pass
@@ -247,15 +312,126 @@ async def test_sam_drafter_accepts_one_wrapped_json_object(raw):
     with patch("run_agent.AIAgent", FakeAgent):
         result = await adapter._draft_sam_restricted({"body": "What is your role?"})
 
-    assert result == {"outcome": "DIRECT_REPLY", "reply": "Hello", "reason": "Safe"}
+    assert result == {
+        "outcome": "DIRECT_REPLY",
+        "informational_content": "Hello",
+        "reason": "Safe",
+        "proposed_action_verb": "",
+        "proposed_action_object": "",
+        "proposed_action_target": "",
+        "required_authority": "",
+        "validation_marker": "SAM_RESTRICTED_VALIDATED_V1",
+        "validation_reason": "safe",
+        "validation_effect": "INFORMATIONAL",
+    }
+
+
+@pytest.mark.asyncio
+async def test_sam_drafter_accepts_partial_reply_with_specific_action_request():
+    adapter = make_adapter()
+    draft_raw, validation_raw = draft_result(
+        "SEND_AND_REVIEW_ACTION",
+        "I can help plan it; Alex must approve creating it.",
+        "Safe discussion plus external action.",
+        verb="Create",
+        obj="the shared calendar",
+        target="for Sam and Alex",
+        authority="Alex must explicitly approve creating it.",
+    )
+    responses = iter([draft_raw, validation_raw])
+
+    class FakeAgent:
+        def __init__(self, **_kwargs):
+            pass
+
+        def run_conversation(self, *_args, **_kwargs):
+            return {"final_response": next(responses)}
+
+        def close(self):
+            pass
+
+    with patch("run_agent.AIAgent", FakeAgent):
+        result = await adapter._draft_sam_restricted({"body": "Set up a shared calendar"})
+
+    assert result["outcome"] == "SEND_AND_REVIEW_ACTION"
+    assert result["proposed_action_object"] == "the shared calendar"
+
+
+@pytest.mark.asyncio
+async def test_sam_drafter_marks_semantically_unsafe_information_unvalidated():
+    adapter = make_adapter()
+    draft_raw, _validation_raw = draft_result(
+        "DIRECT_REPLY",
+        "Access is all set and the provider returned a raw failure.",
+        "Candidate answer.",
+    )
+    failed_validation = (
+        '{"verdict":"FAIL","validation_marker":"",'
+        '"reason":"candidate contains prohibited status or diagnostics",'
+        '"effect":"INFORMATIONAL"}'
+    )
+    responses = iter([draft_raw, failed_validation])
+
+    class FakeAgent:
+        def __init__(self, **_kwargs):
+            pass
+
+        def run_conversation(self, *_args, **_kwargs):
+            return {"final_response": next(responses)}
+
+        def close(self):
+            pass
+
+    with patch("run_agent.AIAgent", FakeAgent):
+        result = await adapter._draft_sam_restricted({"body": "Can you explain this?"})
+
+    assert result["validation_marker"] == ""
+    assert result["validation_reason"] == (
+        "candidate contains prohibited status or diagnostics"
+    )
+
+
+@pytest.mark.asyncio
+async def test_sam_validator_effect_must_align_with_declared_outcome():
+    adapter = make_adapter()
+    draft_raw, mismatched_validation = draft_result(
+        "DIRECT_REPLY",
+        "Here are some planning ideas.",
+        "Draft called this informational.",
+        effect="PROTECTED_ACTION",
+    )
+    responses = iter([draft_raw, mismatched_validation])
+
+    class FakeAgent:
+        def __init__(self, **_kwargs):
+            pass
+
+        def run_conversation(self, *_args, **_kwargs):
+            return {"final_response": next(responses)}
+
+        def close(self):
+            pass
+
+    with patch("run_agent.AIAgent", FakeAgent):
+        result = await adapter._draft_sam_restricted(
+            {"body": "Arrange a sitter and confirm it with them."}
+        )
+
+    assert result["validation_marker"] == ""
+    assert result["validation_effect"] == "PROTECTED_ACTION"
+    assert result["validation_reason"] == (
+        "validator effect does not match drafted outcome"
+    )
 
 
 @pytest.mark.asyncio
 async def test_sam_drafter_repairs_malformed_json_once():
     adapter = make_adapter()
+    draft_raw, validation_raw = draft_result("DIRECT_REPLY", "Hello", "Safe")
     responses = iter([
         "{not valid json}",
-        '{"outcome":"DIRECT_REPLY","reply":"Hello","reason":"Safe"}',
+        draft_raw,
+        validation_raw,
     ])
     calls = []
 
@@ -274,7 +450,7 @@ async def test_sam_drafter_repairs_malformed_json_once():
         result = await adapter._draft_sam_restricted({"body": "What is your role?"})
 
     assert result["outcome"] == "DIRECT_REPLY"
-    assert len(calls) == 2
+    assert len(calls) == 3
     assert "previous output was invalid" in calls[1].lower()
 
 
@@ -311,7 +487,7 @@ async def test_sam_drafter_rejects_empty_direct_reply():
 
         def run_conversation(self, *_args, **_kwargs):
             return {
-                "final_response": '{"outcome":"DIRECT_REPLY","reply":"","reason":"Safe"}'
+                "final_response": '{"outcome":"DIRECT_REPLY","informational_content":"","reason":"Safe","proposed_action_verb":"","proposed_action_object":"","proposed_action_target":"","required_authority":""}'
             }
 
         def close(self):
