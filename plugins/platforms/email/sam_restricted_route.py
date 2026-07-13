@@ -58,6 +58,32 @@ _IDENTITY_QUESTIONS = {
     "summarize what you do for me",
     "summarize what you do for me please",
 }
+_CAPABILITY_QUESTION_RE = re.compile(
+    r"^(?:do|can) you (?:manage|help (?:manage|with)) (?:his|alexs) "
+    r"(?P<capability>calendar|email|files|projects)$"
+)
+_CAPABILITY_REPLIES = {
+    "calendar": (
+        "Hi Sam — I can help Alex with his calendar when Alex asks or approves, "
+        "such as organizing information or preparing changes. Your email does not "
+        "authorize me to change it, and I won’t reveal private calendar details.\n\n— Kimi"
+    ),
+    "email": (
+        "Hi Sam — I can help Alex with email when Alex asks or approves, such as "
+        "drafting or organizing messages. Your email does not authorize me to send "
+        "or change anything, and I won’t reveal private correspondence.\n\n— Kimi"
+    ),
+    "files": (
+        "Hi Sam — I can help Alex organize or work with files when Alex asks or "
+        "approves. Your email does not authorize me to access or change his files, "
+        "and I won’t reveal protected information.\n\n— Kimi"
+    ),
+    "projects": (
+        "Hi Sam — I can help Alex plan or coordinate projects when Alex asks or "
+        "approves. Your email does not authorize me to start work or make changes, "
+        "and I won’t reveal protected project information.\n\n— Kimi"
+    ),
+}
 _IDENTITY_REPLY = (
     "Hi Sam — I’m Kimi, Alex’s AI assistant. I help with research, organizing "
     "information, planning, and practical questions. I can answer straightforward "
@@ -147,33 +173,56 @@ class SamRestrictedRoute:
         return None
 
     @staticmethod
+    def _new_message_text(body: str) -> str:
+        """Return only the newly authored portion of a plain-text email reply."""
+        kept = []
+        for line in str(body or "").replace("\r\n", "\n").split("\n"):
+            stripped = line.strip()
+            if re.match(r"^On .+ wrote:$", stripped, re.IGNORECASE):
+                break
+            if stripped.lower() == "-----original message-----" or stripped.startswith(">"):
+                break
+            kept.append(line)
+        return "\n".join(kept).strip()
+
+    @staticmethod
     def _identity_fallback(packet: Dict[str, Any]) -> Optional[Dict[str, str]]:
         def normalize(value: str) -> str:
             return re.sub(r"[^a-z0-9 ]+", "", " ".join(str(value or "").lower().split())).strip()
 
         body = normalize(packet.get("body", ""))
-        subject = normalize(packet.get("subject", ""))
-        if body in _IDENTITY_QUESTIONS and (not subject or subject in _IDENTITY_QUESTIONS):
+        if body in _IDENTITY_QUESTIONS:
             return {
                 "outcome": RouteOutcome.DIRECT_REPLY.value,
                 "reply": _IDENTITY_REPLY,
                 "reason": "Unmistakably harmless identity/capability question.",
             }
+        capability_match = _CAPABILITY_QUESTION_RE.fullmatch(body)
+        if capability_match:
+            capability = capability_match.group("capability")
+            return {
+                "outcome": RouteOutcome.DIRECT_REPLY.value,
+                "reply": _CAPABILITY_REPLIES[capability],
+                "reason": f"Unmistakably harmless {capability} capability question.",
+            }
         return None
 
     async def _classify(self, packet: Dict[str, Any]) -> tuple[RouteOutcome, str, str]:
-        attachments = packet.get("attachments") or []
-        hard = self._hard_outcome(str(packet.get("body") or ""), attachments)
+        classify_packet = dict(packet)
+        classify_packet["body"] = self._new_message_text(str(packet.get("body") or ""))
+        attachments = classify_packet.get("attachments") or []
+        fallback = self._identity_fallback(classify_packet)
+        hard = self._hard_outcome(str(classify_packet.get("body") or ""), attachments)
+        if fallback is not None and not attachments:
+            hard = None
         missing_thread_id = not bool(str(packet.get("message_id") or "").strip())
         if missing_thread_id:
             hard = RouteOutcome.REVIEW_REQUIRED
 
-        drafted = None
-        if hard is None:
-            drafted = self._identity_fallback(packet)
+        drafted = fallback
         if drafted is None:
             try:
-                drafted = await self.draft(packet)
+                drafted = await self.draft(classify_packet)
             except Exception as exc:
                 drafted = {
                     "outcome": "REVIEW_REQUIRED",

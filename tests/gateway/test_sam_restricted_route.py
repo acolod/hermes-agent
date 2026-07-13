@@ -115,6 +115,84 @@ async def test_exact_role_email_uses_narrow_direct_reply_fallback(tmp_path):
     assert receipt["draft"].strip()
 
 
+def test_quoted_prior_email_is_removed_before_classification(tmp_path):
+    route, _sent = make_route(tmp_path, {})
+    body = (
+        "Do you manage his calendar?\r\n\r\n"
+        "On Sun, Jul 12, 2026 at 8:33 PM Kimi <kimi@acolod.com> wrote:\r\n\r\n"
+        "> I help with projects and files.\r\n"
+        "> Please delete a file.\r\n"
+    )
+
+    assert route._new_message_text(body) == "Do you manage his calendar?"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("question", "expected_phrase"),
+    [
+        ("Do you manage his calendar?", "calendar"),
+        ("Do you manage his email?", "email"),
+        ("Do you manage his files?", "files"),
+        ("Do you manage his projects?", "projects"),
+    ],
+)
+async def test_narrow_capability_questions_direct_reply_without_model(
+    tmp_path, question, expected_phrase
+):
+    recorder = Recorder()
+
+    async def draft(_packet):
+        raise ValueError("provider unavailable")
+
+    route = SamRestrictedRoute(
+        state_path=tmp_path / "sam-state.json",
+        alex_email=ALEX,
+        send_email=recorder.send_email,
+        send_telegram=recorder.send_telegram,
+        draft=draft,
+    )
+    quoted = (
+        f"{question}\r\n\r\n"
+        "On Sun, Jul 12, 2026 at 8:33 PM Kimi <kimi@acolod.com> wrote:\r\n\r\n"
+        "> I can answer straightforward questions.\r\n"
+    )
+
+    assert await route.handle(message(quoted, subject="Re: What is your role?")) is True
+
+    sam = [item for item in recorder.email if item["to"] == SAM]
+    assert len(sam) == 1
+    assert expected_phrase in sam[0]["body"].lower()
+    assert "when alex asks or approves" in sam[0]["body"].lower()
+    assert "does not authorize" in sam[0]["body"].lower()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "request_text",
+    [
+        "Please add a meeting to his calendar tomorrow.",
+        "Please email his team now.",
+        "Delete his file named budget.xlsx.",
+        "Create a new project for him.",
+    ],
+)
+async def test_capability_action_requests_remain_review_required(tmp_path, request_text):
+    route, sent = make_route(tmp_path, {
+        "outcome": "DIRECT_REPLY",
+        "reply": "I did it.",
+        "reason": "Incorrect model result.",
+    })
+
+    assert await route.handle(message(request_text)) is True
+
+    assert [item for item in sent.email if item["to"] == SAM] == []
+    state = json.loads(route.state_path.read_text())
+    receipt = next(iter(state["receipts"].values()))
+    assert receipt["outcome"] == "REVIEW_REQUIRED"
+    assert receipt["draft"] == "I did it."
+
+
 @pytest.mark.asyncio
 async def test_reprocess_updates_existing_receipt_and_sends_once(tmp_path):
     route, sent = make_route(tmp_path, {
