@@ -15,6 +15,7 @@ import logging
 import os
 import html as _html
 import re
+import tempfile
 import threading
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Any
@@ -162,6 +163,7 @@ try:
         Application,
         CommandHandler,
         CallbackQueryHandler,
+        ApplicationHandlerStop,
         MessageHandler as TelegramMessageHandler,
         ContextTypes,
         filters,
@@ -180,6 +182,7 @@ except ImportError:
     Application = Any
     CommandHandler = Any
     CallbackQueryHandler = Any
+    ApplicationHandlerStop = Exception
     TelegramMessageHandler = Any
     HTTPXRequest = Any
     filters = None
@@ -252,7 +255,7 @@ def check_telegram_requirements() -> bool:
     """
     global TELEGRAM_AVAILABLE, Update, Bot, Message, InlineKeyboardButton
     global InlineKeyboardMarkup, LinkPreviewOptions, Application
-    global CommandHandler, CallbackQueryHandler, TelegramMessageHandler
+    global CommandHandler, CallbackQueryHandler, ApplicationHandlerStop, TelegramMessageHandler
     global ContextTypes, filters, ParseMode, ChatType, HTTPXRequest
     if TELEGRAM_AVAILABLE:
         return True
@@ -271,6 +274,7 @@ def check_telegram_requirements() -> bool:
         from telegram.ext import (
             Application as _App, CommandHandler as _CH,
             CallbackQueryHandler as _CQH,
+            ApplicationHandlerStop as _AHS,
             MessageHandler as _MH,
             ContextTypes as _CT, filters as _filters,
         )
@@ -287,6 +291,7 @@ def check_telegram_requirements() -> bool:
     Application = _App
     CommandHandler = _CH
     CallbackQueryHandler = _CQH
+    ApplicationHandlerStop = _AHS
     TelegramMessageHandler = _MH
     ContextTypes = _CT
     filters = _filters
@@ -502,10 +507,38 @@ class TelegramAdapter(BasePlatformAdapter):
         """Telegram measures message length in UTF-16 code units."""
         return utf16_len
 
+    @staticmethod
+    def _build_idea_inbox_bridge(config: PlatformConfig):
+        """Load the shared Idea Inbox bridge only when explicitly configured."""
+        extra = getattr(config, "extra", {}) or {}
+        source_root = str(extra.get("idea_inbox_source_root", "")).strip()
+        allowed_user_id = str(extra.get("idea_inbox_allowed_user_id", "")).strip()
+        if not source_root or not allowed_user_id:
+            return None
+        if source_root not in sys.path:
+            sys.path.insert(0, source_root)
+        try:
+            from idea_inbox.telegram_bridge import IdeaInboxTelegramBridge
+
+            excluded = {
+                value.strip()
+                for value in str(extra.get("idea_inbox_excluded_chat_ids", "")).split(",")
+                if value.strip()
+            }
+            return IdeaInboxTelegramBridge(
+                str(extra.get("idea_inbox_root", "~/.hermes/idea-inbox")),
+                allowed_user_id=allowed_user_id,
+                excluded_chat_ids=excluded,
+            )
+        except Exception:
+            logger.exception("Idea Inbox Telegram bridge failed closed during initialization")
+            return None
+
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.TELEGRAM)
         self._app: Optional[Application] = None
         self._bot: Optional[Bot] = None
+        self._idea_inbox_bridge = self._build_idea_inbox_bridge(config)
         self._webhook_mode: bool = False
         self._mention_patterns = self._compile_mention_patterns()
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
@@ -2986,6 +3019,70 @@ class TelegramAdapter(BasePlatformAdapter):
             if self._post_connect_task is asyncio.current_task():
                 self._post_connect_task = None
 
+    async def _handle_idea_inbox_message(self, update, context) -> None:
+        """Capture only the enrolled Alex-only Idea Inbox lane."""
+        message = getattr(update, "effective_message", None) or getattr(update, "message", None)
+        if message is None or self._idea_inbox_bridge is None:
+            return
+        payload = update.to_dict()
+        text = (getattr(message, "text", None) or "").split("@", 1)[0].strip()
+        if text == "/idea_inbox_setup":
+            response = self._idea_inbox_bridge.setup(payload)
+            if response:
+                await message.reply_text(response)
+                raise ApplicationHandlerStop
+            return
+        if not self._idea_inbox_bridge.matches(payload):
+            return
+
+        downloaded_path = await self._download_idea_inbox_media(message)
+        try:
+            response = self._idea_inbox_bridge.route(payload, downloaded_path)
+        finally:
+            if downloaded_path:
+                _Path(downloaded_path).unlink(missing_ok=True)
+        if response:
+            await message.reply_text(response)
+        raise ApplicationHandlerStop
+
+    async def _download_idea_inbox_media(self, message) -> str | None:
+        """Download one capture attachment for the shared Idea Inbox router."""
+        media = (
+            (message.photo[-1] if getattr(message, "photo", None) else None)
+            or getattr(message, "voice", None)
+            or getattr(message, "audio", None)
+            or getattr(message, "video", None)
+            or getattr(message, "document", None)
+        )
+        if media is None or self._app is None:
+            return None
+        media_type = (
+            "image" if getattr(message, "photo", None)
+            else "voice" if getattr(message, "voice", None)
+            else "audio" if getattr(message, "audio", None)
+            else "video" if getattr(message, "video", None)
+            else "file"
+        )
+        file_name = getattr(media, "file_name", None)
+        suffix = _Path(file_name).suffix if file_name else {
+            "image": ".jpg",
+            "voice": ".ogg",
+            "audio": ".mp3",
+            "video": ".mp4",
+            "file": "",
+        }[media_type]
+        handle = tempfile.NamedTemporaryFile(
+            prefix="idea-inbox-telegram-", suffix=suffix, delete=False
+        )
+        handle.close()
+        try:
+            telegram_file = await self._app.bot.get_file(media.file_id)
+            await telegram_file.download_to_drive(handle.name)
+            return handle.name
+        except Exception:
+            _Path(handle.name).unlink(missing_ok=True)
+            raise
+
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to Telegram via polling or webhook.
 
@@ -3174,6 +3271,15 @@ class TelegramAdapter(BasePlatformAdapter):
             self._app = builder.build()
             self._bot = self._app.bot
             
+            # Register the fail-closed Idea Inbox lane before all normal Hermes
+            # handlers. Until Alex enrolls a dedicated group/topic it matches
+            # nothing, preserving normal DM and Hermes Ops behavior.
+            if self._idea_inbox_bridge is not None:
+                self._app.add_handler(
+                    TelegramMessageHandler(filters.ALL, self._handle_idea_inbox_message),
+                    group=-100,
+                )
+
             # Register handlers
             self._app.add_handler(TelegramMessageHandler(
                 filters.TEXT & ~filters.COMMAND,
