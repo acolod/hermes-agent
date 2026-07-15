@@ -456,6 +456,48 @@ def _is_accepted_host(host_header: str, bound_host: str) -> bool:
     return host_only == bound_lc
 
 
+def _normalize_dashboard_trusted_origins(values: Any) -> frozenset[str]:
+    """Return strict canonical HTTP origins accepted for proxied WebSockets.
+
+    Origins must be bare ``http(s)://host[:port]`` values. Credentials,
+    paths, queries, and fragments are rejected so an operator cannot
+    accidentally configure a broader or ambiguous trust boundary.
+    """
+    if not isinstance(values, (list, tuple, set, frozenset)):
+        return frozenset()
+
+    normalized: set[str] = set()
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        candidate = value.strip()
+        try:
+            parsed = urllib.parse.urlparse(candidate)
+            port = parsed.port
+        except ValueError:
+            continue
+        if (
+            parsed.scheme.lower() not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path
+            or "?" in candidate
+            or "#" in candidate
+            or parsed.params
+            or parsed.query
+            or parsed.fragment
+        ):
+            continue
+
+        host = parsed.hostname.lower()
+        if ":" in host:
+            host = f"[{host}]"
+        authority = f"{host}:{port}" if port is not None else host
+        normalized.add(f"{parsed.scheme.lower()}://{authority}")
+    return frozenset(normalized)
+
+
 @app.middleware("http")
 async def host_header_middleware(request: Request, call_next):
     """Reject requests whose Host header doesn't match the bound interface.
@@ -14556,6 +14598,10 @@ def _ws_host_origin_reason(ws: "WebSocket") -> Optional[str]:
     if not parsed.netloc:
         return f"origin_mismatch origin={origin} bound={bound_host}"
 
+    trusted_origins = getattr(app.state, "trusted_origins", frozenset())
+    if _normalize_dashboard_trusted_origins([origin]) & trusted_origins:
+        return None
+
     if not _is_accepted_host(parsed.netloc, bound_host):
         return f"origin_mismatch origin={origin} bound={bound_host}"
     return None
@@ -17233,6 +17279,19 @@ def start_server(
             host,
             ", ".join(p.name for p in list_providers()),
         )
+
+    # Snapshot explicitly configured reverse-proxy origins at startup. The Host
+    # guard still runs first; this allowlist only permits the browser's public
+    # Origin after a trusted proxy has rewritten Host to the loopback address.
+    dashboard_config = load_config().get("dashboard", {})
+    configured_origins = (
+        dashboard_config.get("trusted_origins", [])
+        if isinstance(dashboard_config, dict)
+        else []
+    )
+    app.state.trusted_origins = _normalize_dashboard_trusted_origins(
+        configured_origins
+    )
 
     # Record the bound host so host_header_middleware can validate incoming
     # Host headers against it. Defends against DNS rebinding (GHSA-ppp5-vxwm-4cf7).

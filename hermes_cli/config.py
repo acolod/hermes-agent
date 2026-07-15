@@ -1954,6 +1954,11 @@ DEFAULT_CONFIG = {
     # Web dashboard settings
     "dashboard": {
         "theme": "default",  # Dashboard visual theme: "default", "midnight", "ember", "mono", "cyberpunk", "rose"
+        # Exact browser origins permitted for WebSocket upgrades when a trusted
+        # reverse proxy rewrites Host to the loopback address Hermes is bound
+        # to. Entries must be bare http(s) origins (no path/query/credentials).
+        # The Host-header and credential checks still run independently.
+        "trusted_origins": [],
         # Hide the token/cost analytics surfaces (Analytics page, token bars and
         # cost figures on the Models page) by default.  The numbers shown there
         # are a local debug estimate: they only count successful main-agent
