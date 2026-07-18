@@ -1802,7 +1802,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 # rich message; treat as a successful no-op so the caller does
                 # not fall through to a redundant legacy edit.
                 if "not modified" in str(exc).lower():
-                    return SendResult(success=True, message_id=message_id)
+                    return SendResult(
+                        success=True,
+                        message_id=message_id,
+                        raw_response={"status": "noop", "reason": "not_modified"},
+                    )
                 logger.debug(
                     "[%s] rich editMessageText rejected (%s) — falling back to MarkdownV2 edit",
                     self.name, exc,
@@ -4224,13 +4228,48 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._status_message_ids.pop(oldest_key, None)
 
         cached_id = self._status_message_ids.get(key)
+        binding_source = "memory" if cached_id is not None else None
         if cached_id is None:
             persisted_id = (metadata or {}).get("status_message_id")
             if persisted_id is not None and str(persisted_id).strip():
                 cached_id = str(persisted_id).strip()
+                binding_source = "persisted"
         if cached_id is not None:
+            logger.info(
+                "Telegram status binding source=%s chat=%s thread=%s status_key=%s "
+                "message_id=%s",
+                binding_source,
+                chat_id,
+                thread_id,
+                status_key,
+                cached_id,
+            )
+            logger.info(
+                "Telegram status edit begin chat=%s thread=%s status_key=%s message_id=%s",
+                chat_id,
+                thread_id,
+                status_key,
+                cached_id,
+            )
             result = await self.edit_message(
                 chat_id, cached_id, content, finalize=True, metadata=metadata,
+            )
+            raw_response = result.raw_response if isinstance(result.raw_response, dict) else {}
+            disposition = (
+                "no-op"
+                if raw_response.get("status") == "noop"
+                else ("success" if result.success else "failure")
+            )
+            logger.info(
+                "Telegram status edit result chat=%s thread=%s status_key=%s "
+                "message_id=%s success=%s disposition=%s error_kind=%s",
+                chat_id,
+                thread_id,
+                status_key,
+                result.message_id or cached_id,
+                result.success,
+                disposition,
+                getattr(result, "error_kind", None),
             )
             if result.success:
                 _remember(result.message_id or cached_id)
@@ -4337,7 +4376,11 @@ class TelegramAdapter(BasePlatformAdapter):
             except Exception as fmt_err:
                 # "Message is not modified" is a no-op, not an error
                 if "not modified" in str(fmt_err).lower():
-                    return SendResult(success=True, message_id=message_id)
+                    return SendResult(
+                        success=True,
+                        message_id=message_id,
+                        raw_response={"status": "noop", "reason": "not_modified"},
+                    )
                 # Fallback: strip MarkdownV2 escapes and retry as clean plain text
                 safe_format_error = _redact_telegram_error_text(fmt_err)
                 logger.warning(
@@ -4373,7 +4416,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 truncated = self._truncate_stream_overflow_preview(content)
                 if self._last_overflow_preview.get(_preview_key) == truncated:
                     # Saturated-preview dedup (see pre-flight path above).
-                    return SendResult(success=True, message_id=message_id)
+                    return SendResult(
+                        success=True,
+                        message_id=message_id,
+                        raw_response={"status": "noop", "reason": "not_modified"},
+                    )
                 await self._bot.edit_message_text(
                     chat_id=normalize_telegram_chat_id(chat_id),
                     message_id=int(message_id),

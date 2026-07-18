@@ -456,6 +456,17 @@ class TaskCardManager:
         if state.platform_message_id:
             metadata["status_message_id"] = state.platform_message_id
 
+        logger.info(
+            "task-card publish begin binding=%s generation=%s revision=%s phase=%s "
+            "activity=%s message_id=%s",
+            state.binding,
+            state.generation,
+            state.revision,
+            state.phase,
+            state.activity_id,
+            state.platform_message_id,
+        )
+
         for attempt in range(1, self.publish_retry_attempts + 1):
             current = self.current_state(binding, topic_identity)
             if (
@@ -484,6 +495,25 @@ class TaskCardManager:
                 success = False
             else:
                 success = result is None or bool(getattr(result, "success", True))
+
+            raw_response = getattr(result, "raw_response", None) if result is not None else None
+            disposition = None
+            if isinstance(raw_response, dict):
+                disposition = {
+                    key: str(raw_response[key])[:64]
+                    for key in ("status", "reason", "error_kind")
+                    if raw_response.get(key) is not None
+                }
+            logger.info(
+                "task-card publish result binding=%s generation=%s revision=%s "
+                "success=%s message_id=%s disposition=%s",
+                state.binding,
+                state.generation,
+                state.revision,
+                success,
+                getattr(result, "message_id", None) if result is not None else None,
+                disposition,
+            )
 
             if success:
                 message_id = getattr(result, "message_id", None) if result is not None else None
@@ -718,6 +748,18 @@ class TaskCardManager:
             uuid.uuid4().hex
             if phase in START_PHASES and previous is not None and previous.terminal
             else None
+        )
+        logger.info(
+            "task-card activity binding=%s kind=%s phase=%s activity=%s "
+            "previous_generation=%s next_generation=%s publisher=%s message_id=%s",
+            binding,
+            activity_kind,
+            phase,
+            activity_id,
+            previous.generation if previous is not None else None,
+            generation or (previous.generation if previous is not None else None),
+            context.status is not None,
+            previous.platform_message_id if previous is not None else None,
         )
         event = self._event(
             context,

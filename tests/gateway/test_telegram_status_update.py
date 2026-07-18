@@ -202,9 +202,10 @@ async def test_status_message_cache_is_bounded(adapter):
 
 
 @pytest.mark.asyncio
-async def test_persisted_status_message_id_recovers_edit_after_restart(adapter):
+async def test_persisted_status_message_id_recovers_edit_after_restart(adapter, caplog):
     """A persisted binding edits the prior bubble when the cache starts empty."""
-    adapter.edit_message.return_value = SendResult(success=True, message_id="100")
+    caplog.set_level("INFO")
+    adapter.edit_message.return_value = SendResult(success=True, message_id="15438")
 
     result = await adapter.send_or_update_status(
         "chat-1",
@@ -212,11 +213,27 @@ async def test_persisted_status_message_id_recovers_edit_after_restart(adapter):
         "recovered",
         metadata={
             "thread_id": "thread-1",
-            "status_message_id": "100",
+            "status_message_id": "15438",
         },
     )
 
     assert result.success is True
     adapter.send.assert_not_awaited()
     adapter.edit_message.assert_awaited_once()
-    assert adapter.edit_message.call_args.args[1] == "100"
+    assert adapter.edit_message.call_args.args[1] == "15438"
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "Telegram status binding source=persisted" in message
+        and "message_id=15438" in message
+        for message in messages
+    )
+    assert any(
+        "Telegram status edit begin" in message and "message_id=15438" in message
+        for message in messages
+    )
+    assert any(
+        "Telegram status edit result" in message
+        and "success=True" in message
+        and "disposition=success" in message
+        for message in messages
+    )
