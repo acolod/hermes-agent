@@ -17561,6 +17561,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 activity_snapshot=snapshot,
                 terminal=bool(terminal),
             )
+            logger.info("task-card activity: task=%s platform=%s chat=%s revision=%s phase=%s", snapshot.get("task_id"), getattr(source.platform, "value", source.platform), source.chat_id, snapshot["revision"], snapshot["phase"])
         except Exception as exc:
             logger.warning("gateway_activity hook invocation failed: %s", exc)
 
@@ -18799,6 +18800,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _todos = _parsed.get("todos") if isinstance(_parsed, dict) else None
                             if isinstance(_todos, list):
                                 _task_card_active[0] = True
+                                logger.info("task-card todo activation: task=%s items=%d", task_card_task_id, len(_todos))
                                 _loop_for_step.call_soon_threadsafe(
                                     lambda: self._emit_gateway_activity(
                                         source=source, session_key=session_key,
