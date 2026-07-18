@@ -564,6 +564,7 @@ def run_conversation(
     persist_user_message: Optional[Any] = None,
     persist_user_timestamp: Optional[float] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    iteration_observer: Optional[callable] = None,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -709,6 +710,8 @@ def run_conversation(
                     messages,
                     int(getattr(agent, "_task_card_turn_start_index", 0)),
                 )
+                if iteration_observer is not None:
+                    iteration_observer(messages, prev_tools)
                 agent.step_callback(api_call_count, prev_tools)
             except Exception as _step_err:
                 logger.debug("step_callback error (iteration %s): %s", api_call_count, _step_err)
