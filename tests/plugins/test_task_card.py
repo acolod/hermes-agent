@@ -118,6 +118,200 @@ def test_manifest_is_discoverable_and_registers_contextual_command_and_hook():
     assert registered["hook"][0] == "gateway_activity"
 
 
+def test_public_renderer_is_a_concise_checklist_without_diagnostic_metadata(tmp_path):
+    plugin = _load_plugin()
+    manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0)
+    context = _context()
+    manager.handle_command("bind Improve task card", context)
+    state = manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "foreground",
+            "phase": "running",
+            "status": "running",
+            "summary": "Implementing the focused change",
+            "terminal": False,
+        },
+    )
+
+    rendered = plugin.render_task_card(state)
+
+    assert rendered == (
+        "📋 **Active task**\n"
+        "**Improve task card**\n\n"
+        "- 🔄 Implementing the focused change"
+    )
+    for hidden in (
+        state.binding,
+        state.revision_hash,
+        state.topic_identity,
+        state.session_key,
+        "binding   :",
+        "revision  :",
+        "route     :",
+        "activity  :",
+    ):
+        if hidden == state.binding:
+            continue
+        assert hidden not in rendered
+
+
+def test_public_renderer_hides_generated_binding_and_diagnostic_summary(tmp_path):
+    plugin = _load_plugin()
+    manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0)
+    context = _context()
+    manager.handle_command("bind", context)
+    binding = manager.store.resolve_binding("telegram:chat-1:topic-9:session-1")
+    state = manager.current_state(binding)
+    state = plugin.replace(
+        state,
+        summary=(
+            f"route: telegram/chat-1; session_key={state.session_key}; "
+            f"hash={state.revision_hash}"
+        ),
+    )
+
+    rendered = plugin.render_task_card(state)
+
+    assert "**Current conversation**" in rendered
+    assert binding not in rendered
+    assert state.session_key not in rendered
+    assert state.revision_hash not in rendered
+    assert "route:" not in rendered
+    assert "session_key=" not in rendered
+    assert "hash=" not in rendered
+    assert rendered.endswith("- 🔄 Task in progress")
+
+
+def test_debug_subcommand_keeps_the_existing_technical_renderer(tmp_path):
+    plugin = _load_plugin()
+    manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0)
+    context = _context()
+    manager.handle_command("bind Improve task card", context)
+
+    rendered = manager.handle_command("debug", context)
+
+    assert "╭─ Task Card" in rendered
+    assert "│ binding   : Improve task card" in rendered
+    assert "│ revision  : rev 1  hash " in rendered
+    assert "│ route     : telegram · chat-1 · topic-9 · session-1" in rendered
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw_args", ["", "refresh"])
+async def test_default_command_refreshes_existing_card_without_posting_snapshot(
+    tmp_path,
+    raw_args,
+):
+    plugin = _load_plugin()
+
+    class FixedMessageStatus(_CaptureStatus):
+        async def upsert_status(self, *args, **kwargs):
+            result = await super().upsert_status(*args, **kwargs)
+            return SimpleNamespace(success=result.success, message_id="bound-message")
+
+    status = FixedMessageStatus()
+    manager = plugin.TaskCardManager(
+        plugin.TaskCardStore(tmp_path),
+        debounce_seconds=0,
+    )
+    context = _context(status=status)
+    manager.handle_command("bind Improve task card", context)
+    await manager.wait_for_publishes()
+    original = manager.current_state("Improve task card")
+    assert original is not None
+    original_message_id = original.platform_message_id
+
+    response = manager.handle_command(raw_args, context)
+    await manager.wait_for_publishes()
+
+    refreshed = manager.current_state("Improve task card")
+    assert response == ""
+    assert refreshed is not None
+    assert refreshed.revision == original.revision
+    assert refreshed.platform_message_id == original_message_id
+    assert status.calls[-1]["revision"] is None
+    assert status.calls[-1]["metadata"]["status_message_id"] == original_message_id
+    assert status.calls[-1]["content"].startswith("📋 **Active task**")
+    assert "binding   :" not in status.calls[-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_refresh_does_not_consume_next_external_lifecycle_revision(tmp_path):
+    plugin = _load_plugin()
+    status = _CaptureStatus()
+    manager = plugin.TaskCardManager(
+        plugin.TaskCardStore(tmp_path),
+        debounce_seconds=0,
+    )
+    context = _context(status=status)
+    manager.handle_command("bind Relay", context)
+    await manager.wait_for_publishes()
+    started = manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "relay",
+            "activity_id": "relay:task-123",
+            "generation": "relay-generation-1",
+            "revision": 1,
+            "phase": "started",
+            "status": "running",
+            "summary": "Relay started",
+            "terminal": False,
+        },
+    )
+    await manager.wait_for_publishes()
+
+    manager.handle_command("refresh", context)
+    await manager.wait_for_publishes()
+    refreshed = manager.current_state("Relay")
+    working = manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "relay",
+            "activity_id": "relay:task-123",
+            "generation": "relay-generation-1",
+            "revision": 2,
+            "phase": "working",
+            "status": "running",
+            "summary": "Relay working",
+            "terminal": False,
+        },
+    )
+
+    assert started is not None and started.revision == 1
+    assert refreshed is not None and refreshed.revision == 1
+    assert working is not None and working.revision == 2
+    assert working.phase == "working"
+
+
+@pytest.mark.asyncio
+async def test_failed_refresh_does_not_advance_persisted_state(tmp_path):
+    plugin = _load_plugin()
+    status = _CaptureStatus(outcomes=[True, False])
+    manager = plugin.TaskCardManager(
+        plugin.TaskCardStore(tmp_path),
+        debounce_seconds=0,
+        publish_retry_attempts=1,
+    )
+    context = _context(status=status)
+    manager.handle_command("bind Improve task card", context)
+    await manager.wait_for_publishes()
+    before = manager.current_state("Improve task card")
+    assert before is not None
+    before = plugin.replace(before, content_hash="legacy-renderer-hash")
+    key = (before.topic_identity, before.binding)
+    manager._state_cache[key] = before
+    manager.store.save(before)
+
+    response = manager.handle_command("refresh", context)
+    await manager.wait_for_publishes()
+
+    assert response == ""
+    assert manager.current_state("Improve task card") == before
+    assert manager.store.load("Improve task card", before.topic_identity) == before
+
+
 @pytest.mark.asyncio
 async def test_bind_persists_topic_identity_revision_and_content_hash(tmp_path):
     plugin = _load_plugin()

@@ -8,6 +8,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import threading
 import uuid
 from dataclasses import asdict, dataclass, replace
@@ -43,10 +44,17 @@ PHASE_RANK = {
     "drafting": 5,
     **{phase: 100 for phase in TERMINAL_PHASES},
 }
-SHOW_COMMANDS = {"", "show", "status", "view", "render"}
+SHOW_COMMANDS = {"", "show", "status", "view", "render", "refresh"}
+DEBUG_COMMANDS = {"debug"}
 TERMINAL_COMMANDS = {"close", "done", "finish", "terminal"}
 MAX_LABEL_LENGTH = 128
 MAX_SUMMARY_LENGTH = 256
+_GENERATED_BINDING_RE = re.compile(r"task-[0-9a-f]{12}\Z")
+_DIAGNOSTIC_FIELD_RE = re.compile(
+    r"\b(?:route|revision|rev|hash|content_hash|revision_hash|generation|chat_id|thread_id|session(?:_key)?|topic_identity|activity(?:_id)?)\s*[:=]",
+    re.IGNORECASE,
+)
+_USE_STATE_REVISION = object()
 
 
 def now_iso() -> str:
@@ -210,6 +218,59 @@ class TaskCardEvent:
 
 
 def render_task_card(state: TaskCardState) -> str:
+    """Render the user-facing card without routing or persistence internals."""
+    phase = (state.phase or "").strip().lower()
+    if phase in {"completed", "ready_for_alex"}:
+        marker = "✅"
+    elif phase in {"failed", "blocked"}:
+        marker = "⚠️"
+    elif phase in {"cancelled", "cancelled_by_user"}:
+        marker = "⛔"
+    elif phase == "queued":
+        marker = "⏳"
+    else:
+        marker = "🔄"
+    title = (
+        "Current conversation"
+        if _GENERATED_BINDING_RE.fullmatch(state.binding)
+        else state.binding
+    )
+    checklist_item = (state.summary or state.status or state.phase or state.binding).strip()
+    diagnostic_values = (
+        state.topic_identity,
+        state.chat_id,
+        state.thread_id,
+        state.session_key,
+        state.revision_hash,
+        state.content_hash,
+        state.generation,
+        state.activity_id,
+    )
+    if _DIAGNOSTIC_FIELD_RE.search(checklist_item) or any(
+        value and str(value) in checklist_item for value in diagnostic_values
+    ):
+        if phase in {"completed", "ready_for_alex"}:
+            checklist_item = "Task completed"
+        elif phase in {"failed", "blocked"}:
+            checklist_item = "Task failed" if phase == "failed" else "Task blocked"
+        elif phase in {"cancelled", "cancelled_by_user"}:
+            checklist_item = "Task cancelled"
+        elif phase == "queued":
+            checklist_item = "Task queued"
+        else:
+            checklist_item = "Task in progress"
+    return "\n".join(
+        [
+            "📋 **Active task**",
+            f"**{title}**",
+            "",
+            f"- {marker} {checklist_item}",
+        ]
+    )
+
+
+def render_task_card_debug(state: TaskCardState) -> str:
+    """Render the original technical snapshot for explicit diagnostics only."""
     lines = [
         "╭─ Task Card ─────────────────────────────╮",
         f"│ binding   : {state.binding}",
@@ -540,16 +601,25 @@ class TaskCardManager:
         key: tuple[str, str],
         publisher: Any,
         state: TaskCardState,
+        *,
+        publication_revision: Any = _USE_STATE_REVISION,
     ) -> None:
         lock = self._publish_locks.setdefault(key, asyncio.Lock())
         async with lock:
-            await self._publish_state(key, publisher, state)
+            await self._publish_state(
+                key,
+                publisher,
+                state,
+                publication_revision=publication_revision,
+            )
 
     async def _publish_state(
         self,
         key: tuple[str, str],
         publisher: Any,
         state: TaskCardState,
+        *,
+        publication_revision: Any = _USE_STATE_REVISION,
     ) -> None:
         topic_identity, binding = key
         metadata = {
@@ -591,7 +661,11 @@ class TaskCardManager:
                 result = publisher.upsert_status(
                     "taskcard",
                     render_task_card(state),
-                    revision=state.revision,
+                    revision=(
+                        state.revision
+                        if publication_revision is _USE_STATE_REVISION
+                        else publication_revision
+                    ),
                     metadata=metadata,
                 )
                 if inspect.isawaitable(result):
@@ -636,11 +710,19 @@ class TaskCardManager:
                         and current.generation == state.generation
                         and current.revision == state.revision
                     ):
-                        if message_id:
-                            current = replace(
-                                current,
-                                platform_message_id=str(message_id),
-                            )
+                        current = replace(
+                            current,
+                            content_hash=(
+                                state.content_hash
+                                if publication_revision is None
+                                else current.content_hash
+                            ),
+                            **(
+                                {"platform_message_id": str(message_id)}
+                                if message_id
+                                else {}
+                            ),
+                        )
                         self._state_cache[key] = current
                         self.store.save(current)
                         self._rollback_states.pop(key, None)
@@ -682,9 +764,22 @@ class TaskCardManager:
                     self.store.save(previous)
         self._resolve_publication_acks(state, False)
 
-    def _spawn_publish(self, state: TaskCardState, publisher: Any) -> None:
+    def _spawn_publish(
+        self,
+        state: TaskCardState,
+        publisher: Any,
+        *,
+        publication_revision: Any = _USE_STATE_REVISION,
+    ) -> None:
         key = (state.topic_identity, state.binding)
-        task = asyncio.get_running_loop().create_task(self._publish(key, publisher, state))
+        task = asyncio.get_running_loop().create_task(
+            self._publish(
+                key,
+                publisher,
+                state,
+                publication_revision=publication_revision,
+            )
+        )
         self._publish_tasks.add(task)
         self._publish_tasks_by_key.setdefault(key, set()).add(task)
 
@@ -726,6 +821,22 @@ class TaskCardManager:
             await asyncio.sleep(self.debounce_seconds + 0.01)
         while self._publish_tasks:
             await asyncio.gather(*list(self._publish_tasks), return_exceptions=True)
+
+    def _refresh_publish(self, state: TaskCardState, publisher: Any) -> TaskCardState:
+        """Force an explicit command refresh through the existing bound message."""
+        with self._lock:
+            key = (state.topic_identity, state.binding)
+            current = self.current_state(state.binding, state.topic_identity) or state
+            if key in self._rollback_states:
+                self._cancel_transaction(key)
+            refreshed = _with_content_hash(current)
+            self._publishers[key] = publisher
+            self._spawn_publish(
+                refreshed,
+                publisher,
+                publication_revision=None,
+            )
+            return refreshed
 
     def _record(
         self,
@@ -842,7 +953,18 @@ class TaskCardManager:
             state = self.current_state(binding, topic_identity)
             if state is None:
                 return "Task card is not bound yet. Use /taskcard bind <label> in this conversation."
+            if context.status is not None:
+                self._refresh_publish(state, context.status)
+                return ""
             return render_task_card(state)
+
+        if command in DEBUG_COMMANDS:
+            if binding is None:
+                return "Task card is not bound yet. Use /taskcard bind <label> in this conversation."
+            state = self.current_state(binding, topic_identity)
+            if state is None:
+                return "Task card is not bound yet. Use /taskcard bind <label> in this conversation."
+            return render_task_card_debug(state)
 
         if command == "bind":
             requested_label = remainder.strip()
@@ -1026,7 +1148,7 @@ def register(ctx: Any) -> None:
         "taskcard",
         _handle_taskcard,
         description="Bind and render the live task card for this conversation",
-        args_hint="[show|bind <label>|flush|reset|close]",
+        args_hint="[show|bind <label>|refresh|debug|flush|reset|close]",
     )
     ctx.register_hook("gateway_activity", _on_gateway_activity)
 
@@ -1041,4 +1163,5 @@ __all__ = [
     "reduce_task_card_state",
     "register",
     "render_task_card",
+    "render_task_card_debug",
 ]
