@@ -156,6 +156,191 @@ def test_public_renderer_is_a_concise_checklist_without_diagnostic_metadata(tmp_
         assert hidden not in rendered
 
 
+def test_structured_kimi_todos_render_as_bounded_claude_style_checklist(tmp_path):
+    plugin = _load_plugin()
+    manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0)
+    context = _context()
+    manager.handle_command("bind Improve checklist", context)
+
+    state = manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "foreground",
+            "phase": "working",
+            "status": "running",
+            "summary": "Implementing checklist support",
+            "todos": [
+                {"id": "inspect", "content": "Inspect existing state", "status": "completed"},
+                {"id": "implement", "content": "Implement item model", "status": "in_progress"},
+                {"id": "test", "content": "Run focused tests", "status": "pending"},
+                {"id": "blocked", "content": "Await external input", "status": "blocked"},
+                {"id": "skip", "content": "Skip deprecated path", "status": "cancelled"},
+                {"id": "fail", "content": "Record failed publication", "status": "failed"},
+            ],
+        },
+    )
+
+    assert [(item.item_id, item.status) for item in state.items] == [
+        ("inspect", "complete"),
+        ("implement", "active"),
+        ("test", "pending"),
+        ("blocked", "blocked"),
+        ("skip", "skipped"),
+        ("fail", "failed"),
+    ]
+    assert plugin.render_task_card(state) == (
+        "📋 **Active task**\n"
+        "**Improve checklist**\n\n"
+        "- ✅ Inspect existing state\n"
+        "- ▶️ Implement item model\n"
+        "- ⬜ Run focused tests\n"
+        "- ⚠️ Await external input\n"
+        "- ➖ Skip deprecated path\n"
+        "- ❌ Record failed publication"
+    )
+
+
+def test_relay_task_plan_metadata_populates_structured_card_items(tmp_path):
+    plugin = _load_plugin()
+    manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0)
+    context = _context()
+    manager.handle_command("bind Relay plan", context)
+
+    state = manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "relay",
+            "activity_id": "relay:task-1",
+            "phase": "working",
+            "status": "running",
+            "summary": "Relay working",
+            "metadata": {
+                "task_plan": [
+                    {"id": "draft", "title": "Draft response", "status": "done"},
+                    {"id": "review", "title": "Review evidence", "status": "running"},
+                ],
+            },
+        },
+    )
+
+    assert [(item.item_id, item.label, item.status) for item in state.items] == [
+        ("draft", "Draft response", "complete"),
+        ("review", "Review evidence", "active"),
+    ]
+
+
+def test_missing_source_ids_are_stable_across_snapshot_reordering():
+    plugin = _load_plugin()
+    first = plugin._task_items_from_snapshot(
+        {"todos": [{"content": "Inspect state"}, {"content": "Run tests"}]}
+    )
+    reordered = plugin._task_items_from_snapshot(
+        {"todos": [{"content": "Run tests"}, {"content": "Inspect state"}]}
+    )
+
+    assert {item.label: item.item_id for item in first} == {
+        item.label: item.item_id for item in reordered
+    }
+
+
+def test_structured_items_are_bounded_to_the_highest_priority_sixteen():
+    plugin = _load_plugin()
+    items = plugin._task_items_from_snapshot(
+        {"todos": [{"id": f"item-{index}", "content": f"Step {index}"} for index in range(20)]}
+    )
+
+    assert len(items) == 16
+    assert [item.item_id for item in items] == [f"item-{index}" for index in range(16)]
+
+
+def test_late_item_update_cannot_regress_a_completed_item(tmp_path):
+    plugin = _load_plugin()
+    manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0)
+    context = _context()
+    manager.handle_command("bind Safe checklist", context)
+
+    completed = manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "relay",
+            "activity_id": "relay:task-1",
+            "phase": "working",
+            "status": "running",
+            "summary": "Relay working",
+            "task_items": [{"id": "evidence", "label": "Collect evidence", "status": "completed"}],
+        },
+    )
+    late = manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "relay",
+            "activity_id": "relay:task-1",
+            "phase": "working",
+            "status": "running",
+            "summary": "Late relay progress",
+            "task_items": [{"id": "evidence", "label": "Collect evidence", "status": "in_progress"}],
+        },
+    )
+
+    assert completed.items[0].status == "complete"
+    assert late.revision == completed.revision + 1
+    assert late.items[0].status == "complete"
+
+
+@pytest.mark.asyncio
+async def test_checklist_updates_reuse_the_existing_platform_message(tmp_path):
+    plugin = _load_plugin()
+
+    class BoundMessageStatus(_CaptureStatus):
+        async def upsert_status(self, *args, **kwargs):
+            await super().upsert_status(*args, **kwargs)
+            return SimpleNamespace(success=True, message_id="bound-message")
+
+    status = BoundMessageStatus()
+    manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0)
+    context = _context(status=status)
+    manager.handle_command("bind Checklist", context)
+    await manager.wait_for_publishes()
+    first = manager.current_state("Checklist")
+
+    manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "foreground",
+            "phase": "working",
+            "status": "running",
+            "summary": "Implementing checklist",
+            "todos": [{"id": "implement", "content": "Implement checklist", "status": "in_progress"}],
+        },
+    )
+    await manager.wait_for_publishes()
+    updated = manager.current_state("Checklist")
+
+    assert first.platform_message_id == "bound-message"
+    assert updated.platform_message_id == "bound-message"
+    assert status.calls[-1]["metadata"]["status_message_id"] == "bound-message"
+
+
+def test_single_row_fallback_is_preserved_without_structured_items(tmp_path):
+    plugin = _load_plugin()
+    manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0)
+    context = _context()
+    manager.handle_command("bind Fallback", context)
+
+    state = manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "foreground",
+            "phase": "working",
+            "status": "running",
+            "summary": "No structured plan available",
+        },
+    )
+
+    assert state.items == ()
+    assert plugin.render_task_card(state).endswith("- 🔄 No structured plan available")
+
+
 def test_public_renderer_hides_generated_binding_and_diagnostic_summary(tmp_path):
     plugin = _load_plugin()
     manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0)

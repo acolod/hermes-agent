@@ -49,6 +49,39 @@ DEBUG_COMMANDS = {"debug"}
 TERMINAL_COMMANDS = {"close", "done", "finish", "terminal"}
 MAX_LABEL_LENGTH = 128
 MAX_SUMMARY_LENGTH = 256
+MAX_TASK_ITEMS = 16
+MAX_TASK_ITEM_ID_LENGTH = 128
+MAX_TASK_ITEM_LABEL_LENGTH = 160
+_TASK_ITEM_MARKERS = {
+    "pending": "⬜",
+    "active": "▶️",
+    "complete": "✅",
+    "blocked": "⚠️",
+    "skipped": "➖",
+    "failed": "❌",
+}
+_TASK_ITEM_STATUS_MAP = {
+    "active": "active",
+    "cancelled": "skipped",
+    "canceled": "skipped",
+    "complete": "complete",
+    "completed": "complete",
+    "done": "complete",
+    "failed": "failed",
+    "error": "failed",
+    "crashed": "failed",
+    "timed_out": "failed",
+    "in_progress": "active",
+    "running": "active",
+    "working": "active",
+    "ready": "active",
+    "blocked": "blocked",
+    "pending": "pending",
+    "queued": "pending",
+    "scheduled": "pending",
+    "skipped": "skipped",
+    "archived": "skipped",
+}
 _GENERATED_BINDING_RE = re.compile(r"task-[0-9a-f]{12}\Z")
 _DIAGNOSTIC_FIELD_RE = re.compile(
     r"\b(?:route|revision|rev|hash|content_hash|revision_hash|generation|chat_id|thread_id|session(?:_key)?|topic_identity|activity(?:_id)?)\s*[:=]",
@@ -104,6 +137,88 @@ def _phase_rank(phase: str) -> int:
 
 
 @dataclass(frozen=True)
+class TaskCardItem:
+    """One bounded, stable checklist item rendered on a task card."""
+
+    item_id: str
+    label: str
+    status: str
+
+
+def _task_item_status(value: Any) -> str:
+    return _TASK_ITEM_STATUS_MAP.get(str(value or "").strip().lower(), "pending")
+
+
+def _task_items_from_snapshot(snapshot: dict[str, Any]) -> tuple[TaskCardItem, ...] | None:
+    """Extract structured Kimi, Kanban, or Relay plan data without a new engine."""
+    sources = [snapshot]
+    metadata = snapshot.get("metadata")
+    if isinstance(metadata, dict):
+        sources.append(metadata)
+    raw_items: Any = None
+    source_name = "items"
+    for source in sources:
+        for key in ("task_items", "todos", "kanban_tasks", "task_plan", "plan"):
+            candidate = source.get(key) if isinstance(source, dict) else None
+            if isinstance(candidate, list):
+                raw_items = candidate
+                source_name = key
+                break
+        if raw_items is not None:
+            break
+    if raw_items is None:
+        return None
+
+    items: list[TaskCardItem] = []
+    seen: set[str] = set()
+    for raw_item in raw_items:
+        if not isinstance(raw_item, dict):
+            continue
+        label = str(
+            raw_item.get("label")
+            or raw_item.get("content")
+            or raw_item.get("title")
+            or raw_item.get("name")
+            or raw_item.get("summary")
+            or ""
+        ).strip()
+        if not label:
+            continue
+        label = label[:MAX_TASK_ITEM_LABEL_LENGTH]
+        supplied_id = str(
+            raw_item.get("id") or raw_item.get("task_id") or raw_item.get("key") or ""
+        ).strip()
+        item_id = supplied_id[:MAX_TASK_ITEM_ID_LENGTH] or (
+            f"{source_name}:{hashlib.sha256(label.encode('utf-8')).hexdigest()[:12]}"
+        )
+        if item_id in seen:
+            continue
+        seen.add(item_id)
+        items.append(
+            TaskCardItem(
+                item_id=item_id,
+                label=label,
+                status=_task_item_status(raw_item.get("status") or raw_item.get("state") or raw_item.get("phase")),
+            )
+        )
+        if len(items) >= MAX_TASK_ITEMS:
+            break
+    return tuple(items)
+
+
+def _merge_task_items(
+    previous: tuple[TaskCardItem, ...],
+    incoming: tuple[TaskCardItem, ...],
+) -> tuple[TaskCardItem, ...]:
+    """Keep completed work complete when a late source snapshot regresses it."""
+    completed = {item.item_id for item in previous if item.status == "complete"}
+    return tuple(
+        replace(item, status="complete") if item.item_id in completed else item
+        for item in incoming
+    )
+
+
+@dataclass(frozen=True)
 class TaskCardState:
     binding: str
     topic_identity: str
@@ -128,6 +243,7 @@ class TaskCardState:
     activity_snapshot: dict[str, Any] | None = None
     metadata: dict[str, Any] | None = None
     retired_generations: list[str] | None = None
+    items: tuple[TaskCardItem, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return _clean(asdict(self))
@@ -170,6 +286,15 @@ class TaskCardState:
                 for item in list(payload.get("retired_generations") or [])[-16:]
                 if str(item).strip()
             ],
+            items=tuple(
+                TaskCardItem(
+                    item_id=str(item.get("item_id") or item.get("id") or "")[:MAX_TASK_ITEM_ID_LENGTH],
+                    label=str(item.get("label") or "")[:MAX_TASK_ITEM_LABEL_LENGTH],
+                    status=_task_item_status(item.get("status")),
+                )
+                for item in list(payload.get("items") or [])
+                if isinstance(item, dict) and str(item.get("item_id") or item.get("id") or "").strip() and str(item.get("label") or "").strip()
+            )[:MAX_TASK_ITEMS],
         )
 
 
@@ -192,6 +317,7 @@ class TaskCardEvent:
     summary: str
     activity_snapshot: dict[str, Any]
     metadata: dict[str, Any]
+    items: tuple[TaskCardItem, ...] | None = None
     source_revision: int | None = None
 
     def revision_hash(self) -> str:
@@ -213,6 +339,7 @@ class TaskCardEvent:
                 "thread_id": self.thread_id,
                 "session_key": self.session_key,
                 "summary": self.summary,
+                "items": [asdict(item) for item in self.items or ()],
             }
         )
 
@@ -235,6 +362,18 @@ def render_task_card(state: TaskCardState) -> str:
         if _GENERATED_BINDING_RE.fullmatch(state.binding)
         else state.binding
     )
+    if state.items:
+        return "\n".join(
+            [
+                "📋 **Active task**",
+                f"**{title}**",
+                "",
+                *[
+                    f"- {_TASK_ITEM_MARKERS[item.status]} {item.label}"
+                    for item in state.items
+                ],
+            ]
+        )
     checklist_item = (state.summary or state.status or state.phase or state.binding).strip()
     diagnostic_values = (
         state.topic_identity,
@@ -302,6 +441,7 @@ def reduce_task_card_state(
 ) -> TaskCardState:
     event_hash = event.revision_hash()
     retired_generations: list[str] = []
+    same_generation = False
     if previous is not None:
         retired_generations = list(previous.retired_generations or [])[-16:]
         if event.generation in retired_generations:
@@ -341,6 +481,12 @@ def reduce_task_card_state(
     else:
         revision = event.source_revision or 1
 
+    items = event.items
+    if items is None:
+        items = previous.items if previous is not None else ()
+    elif previous is not None and same_generation:
+        items = _merge_task_items(previous.items, items)
+
     state = TaskCardState(
         binding=event.binding,
         topic_identity=event.topic_identity,
@@ -367,6 +513,7 @@ def reduce_task_card_state(
         activity_snapshot=event.activity_snapshot,
         metadata={**dict(previous.metadata or {}), **event.metadata} if previous else event.metadata,
         retired_generations=retired_generations,
+        items=items,
     )
     return _with_content_hash(state)
 
@@ -937,6 +1084,7 @@ class TaskCardManager:
                     if not str(key).startswith("_")
                 }
             ),
+            items=_task_items_from_snapshot(activity_snapshot or {}),
             source_revision=source_revision,
         )
 
