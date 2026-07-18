@@ -145,6 +145,20 @@ class FakeAgent:
         }
 
 
+class TodoStepCallbackAgent:
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.step_callback = None
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
+        assert self.step_callback is not None
+        self.step_callback(2, [{"name": "todo", "arguments": "{}", "result": '{"todos":[{"id":"current","content":"Current","status":"pending"}]}'}])
+        self.tool_progress_callback("tool.started", "terminal", "after-todo", {})
+        time.sleep(0.1)
+        return {"final_response": "done", "messages": [], "api_calls": 2}
+
+
 class ThinkingAgent:
     """Agent that emits _thinking scratch text (no tool calls).
 
@@ -315,6 +329,32 @@ async def test_run_agent_progress_stays_in_originating_topic(monkeypatch, tmp_pa
     ]
     assert adapter.edits
     assert all(call["metadata"] == {"thread_id": "17585"} for call in adapter.typing)
+
+
+@pytest.mark.asyncio
+async def test_group_todo_step_callback_activates_card_before_next_progress(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = TodoStepCallbackAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    adapter = ProgressCaptureAdapter()
+    runner = _make_runner(adapter)
+    runner.hooks = SimpleNamespace(loaded_hooks=False, emit=lambda *_args: asyncio.sleep(0))
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
+    activities = []
+    monkeypatch.setattr(runner, "_emit_gateway_activity", lambda **kwargs: activities.append(kwargs))
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="-1001", chat_type="group", thread_id="17585")
+    result = await runner._run_agent(message="hello", context_prompt="", history=[], source=source, session_id="sess-1", session_key="agent:main:telegram:group:-1001:17585")
+    assert result["final_response"] == "done"
+    working = [item for item in activities if item["phase"] == "working"]
+    assert len(working) == 1
+    assert working[0]["task_items"][0]["id"] == "current"
+    assert adapter.sent == []
 
 
 @pytest.mark.asyncio
