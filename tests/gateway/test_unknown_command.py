@@ -147,6 +147,50 @@ async def test_known_slash_command_not_flagged_as_unknown(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_plugin_command_dispatches_while_agent_is_running(monkeypatch):
+    """Contextual plugin commands bypass the busy-turn input policy."""
+    import hermes_cli.plugins as plugins_mod
+
+    runner = _make_runner()
+    source = _make_source()
+    runner._running_agents[build_session_key(source)] = MagicMock()
+
+    def handler(raw_args, context):
+        return f"plugin:{raw_args}:{context.origin.chat_id}"
+
+    monkeypatch.setattr(
+        plugins_mod,
+        "get_plugin_command_handler",
+        lambda name: handler if name == "example-plugin" else None,
+    )
+
+    result = await runner._handle_message(_make_event("/example_plugin refresh"))
+
+    assert result == "plugin:refresh:c1"
+
+
+@pytest.mark.asyncio
+async def test_plugin_context_normalizes_underscored_command_name(monkeypatch):
+    """Cold and active dispatch expose the same canonical plugin identity."""
+    import hermes_cli.plugins as plugins_mod
+
+    runner = _make_runner()
+
+    def handler(raw_args, context):
+        return f"{context.command}:{raw_args}"
+
+    monkeypatch.setattr(
+        plugins_mod,
+        "get_plugin_command_handler",
+        lambda name: handler if name == "example-plugin" else None,
+    )
+
+    result = await runner._handle_message(_make_event("/example_plugin refresh"))
+
+    assert result == "example-plugin:refresh"
+
+
+@pytest.mark.asyncio
 async def test_underscored_alias_for_hyphenated_builtin_not_flagged(monkeypatch):
     """Telegram autocomplete sends /reload_mcp for the /reload-mcp built-in.
     That must NOT be flagged as unknown."""
@@ -329,6 +373,9 @@ async def test_command_hook_rewrite_routes_to_plugin(monkeypatch):
     import gateway.run as gateway_run
 
     runner = _make_runner()
+    runner._thread_metadata_for_source = MagicMock(
+        return_value={"thread_id": "derived-thread"}
+    )
     runner._run_agent = AsyncMock(
         side_effect=AssertionError("rewritten command leaked to the agent")
     )
@@ -348,6 +395,7 @@ async def test_command_hook_rewrite_routes_to_plugin(monkeypatch):
         return []
 
     runner.hooks.emit_collect = AsyncMock(side_effect=_emit_collect)
+    seen = {}
 
     monkeypatch.setattr(
         gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
@@ -362,12 +410,24 @@ async def test_command_hook_rewrite_routes_to_plugin(monkeypatch):
     monkeypatch.setattr(
         _plugins_mod,
         "get_plugin_command_handler",
-        lambda name: (lambda args: f"metrics {args}") if name == "metricas" else None,
+        lambda name: (
+            (lambda args, context: seen.update(context=context) or f"metrics {args}")
+            if name == "metricas"
+            else None
+        ),
     )
 
     result = await runner._handle_message(_make_event("/status"))
 
     assert result == "metrics dias:7"
+    assert seen["context"].origin.platform == "telegram"
+    assert seen["context"].origin.chat_id == "c1"
+    assert seen["context"].origin.user_id == "u1"
+    assert seen["context"].origin.session_key
+    assert seen["context"].metadata == {"surface": "gateway"}
+    assert seen["context"].status.chat_id == "c1"
+    assert seen["context"].origin.thread_id == "derived-thread"
+    assert seen["context"].status.thread_id == "derived-thread"
     # First emit_collect fires on the original command; after rewrite the
     # dispatcher does NOT re-fire for the new command (one decision per turn).
     assert call_log == ["command:status"]

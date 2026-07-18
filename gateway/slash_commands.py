@@ -2654,6 +2654,18 @@ class GatewaySlashCommandsMixin:
         self._background_tasks.add(_task)
         _task.add_done_callback(self._background_tasks.discard)
 
+        self._emit_gateway_activity(
+            source=source,
+            session_key=self._session_key_for_source(source),
+            kind="background",
+            phase="background-start",
+            status="running",
+            summary="Background task started",
+            terminal=False,
+            task_id=task_id,
+            event_message_id=getattr(event, "message_id", None),
+        )
+
         preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
         return t("gateway.background.started", preview=preview, task_id=task_id)
 

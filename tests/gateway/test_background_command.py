@@ -85,6 +85,7 @@ class TestHandleBackgroundCommand:
     async def test_valid_prompt_starts_task(self):
         """Running /background with a prompt returns confirmation and starts task."""
         runner = _make_runner()
+        runner._emit_gateway_activity = MagicMock()
 
         # Patch asyncio.create_task to capture the coroutine
         created_tasks = []
@@ -106,6 +107,10 @@ class TestHandleBackgroundCommand:
         assert "bg_" in result  # task ID starts with bg_
         assert "Summarize the top HN stories" in result
         assert len(created_tasks) == 1  # background task was created
+        lifecycle = runner._emit_gateway_activity.call_args.kwargs
+        assert lifecycle["kind"] == "background"
+        assert lifecycle["phase"] == "background-start"
+        assert lifecycle["terminal"] is False
 
     @pytest.mark.asyncio
     async def test_telegram_dm_topic_passes_trigger_anchor_to_task(self):
@@ -197,6 +202,7 @@ class TestRunBackgroundTask:
     async def test_no_adapter_returns_silently(self):
         """When no adapter is available, the task returns without error."""
         runner = _make_runner()
+        runner._emit_gateway_activity = MagicMock()
         source = SessionSource(
             platform=Platform.TELEGRAM,
             user_id="12345",
@@ -205,6 +211,10 @@ class TestRunBackgroundTask:
         )
         # No adapters set — should not raise
         await runner._run_background_task("test prompt", source, "bg_test")
+        lifecycle = runner._emit_gateway_activity.call_args.kwargs
+        assert lifecycle["phase"] == "failed"
+        assert lifecycle["kind"] == "background"
+        assert lifecycle["terminal"] is True
 
     @pytest.mark.asyncio
     async def test_no_credentials_sends_error(self):
@@ -230,9 +240,33 @@ class TestRunBackgroundTask:
         assert "failed" in call_args[1].get("content", call_args[0][1] if len(call_args[0]) > 1 else "").lower()
 
     @pytest.mark.asyncio
+    async def test_no_credentials_send_failure_emits_one_terminal_event(self):
+        """A failed error delivery must not duplicate the lifecycle terminal."""
+        runner = _make_runner()
+        runner._emit_gateway_activity = MagicMock()
+        mock_adapter = AsyncMock()
+        mock_adapter.send = AsyncMock(side_effect=RuntimeError("offline"))
+        runner.adapters[Platform.TELEGRAM] = mock_adapter
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="12345",
+            chat_id="67890",
+        )
+
+        with patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            return_value={"api_key": None},
+        ):
+            await runner._run_background_task("test prompt", source, "bg_test")
+
+        assert runner._emit_gateway_activity.call_count == 1
+        assert runner._emit_gateway_activity.call_args.kwargs["phase"] == "failed"
+
+    @pytest.mark.asyncio
     async def test_successful_task_sends_result(self):
         """When the agent completes successfully, the result is sent."""
         runner = _make_runner()
+        runner._emit_gateway_activity = MagicMock()
         mock_adapter = AsyncMock()
         mock_adapter.send = AsyncMock()
         mock_adapter.extract_media = MagicMock(return_value=([], "Hello from background!"))
@@ -266,6 +300,74 @@ class TestRunBackgroundTask:
         assert "Hello from background!" in content
         mock_agent_instance.shutdown_memory_provider.assert_called_once()
         mock_agent_instance.close.assert_called_once()
+        lifecycle = runner._emit_gateway_activity.call_args.kwargs
+        assert lifecycle["phase"] == "completed"
+        assert lifecycle["kind"] == "background"
+        assert lifecycle["terminal"] is True
+
+    @pytest.mark.asyncio
+    async def test_unsuccessful_result_emits_failed_lifecycle(self):
+        """A returned failure must not be represented as a completed task card."""
+        runner = _make_runner()
+        runner._emit_gateway_activity = MagicMock()
+        mock_adapter = AsyncMock()
+        mock_adapter.send = AsyncMock()
+        mock_adapter.extract_media = MagicMock(return_value=([], "Error: failed"))
+        mock_adapter.extract_images = MagicMock(return_value=([], "Error: failed"))
+        runner.adapters[Platform.TELEGRAM] = mock_adapter
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="12345",
+            chat_id="67890",
+            user_name="testuser",
+        )
+        mock_result = {
+            "final_response": "Error: failed",
+            "messages": [],
+            "failed": True,
+            "error": "failed",
+        }
+
+        with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "test-key"}), \
+             patch("run_agent.AIAgent") as MockAgent:
+            mock_agent_instance = MagicMock()
+            mock_agent_instance.run_conversation.return_value = mock_result
+            MockAgent.return_value = mock_agent_instance
+
+            await runner._run_background_task("fail", source, "bg_test")
+
+        lifecycle = runner._emit_gateway_activity.call_args.kwargs
+        assert lifecycle["phase"] == "failed"
+        assert lifecycle["status"] == "failed"
+        assert lifecycle["terminal"] is True
+
+    @pytest.mark.asyncio
+    async def test_cancelled_task_emits_background_cancellation(self):
+        runner = _make_runner()
+        runner._emit_gateway_activity = MagicMock()
+        adapter = AsyncMock()
+        adapter.send = AsyncMock()
+        runner.adapters[Platform.TELEGRAM] = adapter
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="chat-1",
+            user_id="user-1",
+        )
+
+        with patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            return_value={"api_key": "test-key"},
+        ), patch("run_agent.AIAgent") as MockAgent:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.side_effect = asyncio.CancelledError
+            MockAgent.return_value = mock_agent
+            with pytest.raises(asyncio.CancelledError):
+                await runner._run_background_task("cancel me", source, "bg-cancel")
+
+        lifecycle = runner._emit_gateway_activity.call_args.kwargs
+        assert lifecycle["phase"] == "cancelled"
+        assert lifecycle["status"] == "cancelled"
+        assert lifecycle["terminal"] is True
 
     @pytest.mark.asyncio
     async def test_media_files_routed_by_type(self, monkeypatch):

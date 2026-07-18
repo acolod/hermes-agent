@@ -4203,25 +4203,43 @@ class TelegramAdapter(BasePlatformAdapter):
         Issue #30045: progress/status callbacks (context-pressure, lifecycle,
         compression, etc.) used to append a fresh bubble on every call. With
         this method, the first call sends and the message id is remembered;
-        subsequent calls with the same (chat_id, status_key) edit that same
-        message in place. If the edit fails (message deleted, too old, etc.)
-        we drop the cached id and send fresh.
+        subsequent calls with the same (chat_id, thread_id, status_key) edit
+        that same message in place. If the edit fails (message deleted, too old,
+        etc.) we drop the cached id and send fresh. Calls without thread metadata
+        retain the legacy (chat_id, status_key) cache key.
         """
-        key = (str(chat_id), str(status_key))
+        thread_id = (metadata or {}).get("thread_id")
+        key = (
+            (str(chat_id), str(thread_id), str(status_key))
+            if thread_id is not None
+            else (str(chat_id), str(status_key))
+        )
+
+        def _remember(message_id: str) -> None:
+            self._status_message_ids.pop(key, None)
+            self._status_message_ids[key] = str(message_id)
+            cache_max = max(1, int(getattr(self, "_status_message_cache_max", 256)))
+            while len(self._status_message_ids) > cache_max:
+                oldest_key = next(iter(self._status_message_ids))
+                self._status_message_ids.pop(oldest_key, None)
+
         cached_id = self._status_message_ids.get(key)
+        if cached_id is None:
+            persisted_id = (metadata or {}).get("status_message_id")
+            if persisted_id is not None and str(persisted_id).strip():
+                cached_id = str(persisted_id).strip()
         if cached_id is not None:
             result = await self.edit_message(
                 chat_id, cached_id, content, finalize=True, metadata=metadata,
             )
             if result.success:
-                if result.message_id:
-                    self._status_message_ids[key] = str(result.message_id)
+                _remember(result.message_id or cached_id)
                 return result
             # Edit failed — clear the cached id and fall through to a fresh send.
             self._status_message_ids.pop(key, None)
         result = await self.send(chat_id, content, metadata=metadata)
         if result.success and result.message_id:
-            self._status_message_ids[key] = str(result.message_id)
+            _remember(result.message_id)
         return result
 
     async def edit_message(

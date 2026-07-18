@@ -6,6 +6,7 @@ and implement the required methods.
 """
 
 import asyncio
+import hashlib
 import inspect
 import ipaddress
 import logging
@@ -2955,6 +2956,127 @@ class BasePlatformAdapter(ABC):
         """
         pass
 
+    async def send_or_update_status(
+        self,
+        chat_id: str,
+        status_key: str,
+        content: str,
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a status message, or edit the existing one when supported.
+
+        Platform-neutral fallback: adapters that can keep a stable status
+        bubble (Telegram, and any future edit-capable adapter) override this to
+        edit in place. The base implementation simply sends a fresh message so
+        callers can rely on the contract even on platforms without edit-aware
+        status state.
+        """
+
+        return await self.send(chat_id, content, metadata=metadata)
+
+    async def upsert_status(
+        self,
+        chat_id: str,
+        status_key: str,
+        content: str,
+        *,
+        revision: Optional[int] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Publish a bounded status update with monotonic/no-op protection.
+
+        State is adapter-local and intentionally ephemeral; durable message binding
+        and restart recovery belong to the consuming plugin. A failed publish
+        never advances state, so the same revision can be retried safely.
+        """
+
+        thread_id = (metadata or {}).get("thread_id")
+        generation = (metadata or {}).get("generation")
+        key = (
+            str(chat_id),
+            str(thread_id or ""),
+            str(status_key),
+            str(generation or ""),
+        )
+        states = getattr(self, "_status_upsert_states", None)
+        if states is None:
+            states = {}
+            self._status_upsert_states = states
+        locks = getattr(self, "_status_upsert_locks", None)
+        if locks is None:
+            locks = {}
+            self._status_upsert_locks = locks
+        lock = locks.setdefault(key, asyncio.Lock())
+
+        cache_max = max(1, int(getattr(self, "_status_upsert_cache_max", 256)))
+
+        def _prune_status_cache() -> None:
+            while len(states) > cache_max:
+                evicted = False
+                for old_key in list(states):
+                    old_lock = locks.get(old_key)
+                    if old_lock is None or not old_lock.locked():
+                        states.pop(old_key, None)
+                        locks.pop(old_key, None)
+                        evicted = True
+                        break
+                if not evicted:
+                    break
+            while len(locks) > cache_max:
+                evicted = False
+                for old_key, old_lock in list(locks.items()):
+                    if old_key not in states and not old_lock.locked():
+                        locks.pop(old_key, None)
+                        evicted = True
+                        break
+                if not evicted:
+                    break
+
+        try:
+            async with lock:
+                previous = states.get(key)
+                if previous is not None:
+                    states.pop(key, None)
+                    states[key] = previous
+                if previous is not None and revision is not None:
+                    previous_revision = previous.get("revision")
+                    if previous_revision is not None and revision <= previous_revision:
+                        return SendResult(
+                            success=True,
+                            message_id=previous.get("message_id"),
+                            raw_response={"status": "noop", "reason": "stale_revision"},
+                        )
+
+                content_hash = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()
+                if previous is not None and content_hash == previous.get("content_hash"):
+                    if revision is not None:
+                        previous["revision"] = revision
+                    return SendResult(
+                        success=True,
+                        message_id=previous.get("message_id"),
+                        raw_response={"status": "noop", "reason": "unchanged_content"},
+                    )
+
+                result = await self.send_or_update_status(
+                    chat_id,
+                    status_key,
+                    content,
+                    metadata=metadata,
+                )
+                if result.success:
+                    accepted_revision = revision
+                    if accepted_revision is None and previous is not None:
+                        accepted_revision = previous.get("revision")
+                    states[key] = {
+                        "revision": accepted_revision,
+                        "content_hash": content_hash,
+                        "message_id": result.message_id,
+                    }
+                return result
+        finally:
+            _prune_status_cache()
+
     # Default: the adapter treats ``finalize=True`` on edit_message as a
     # no-op and is happy to have the stream consumer skip redundant final
     # edits.  Subclasses that *require* an explicit finalize call to close
@@ -4707,7 +4829,18 @@ class BasePlatformAdapter(ABC):
             cmd = event.get_command()
             from hermes_cli.commands import should_bypass_active_session
 
-            if should_bypass_active_session(cmd):
+            should_bypass = should_bypass_active_session(cmd)
+            if cmd and not should_bypass:
+                try:
+                    from hermes_cli.plugins import get_plugin_command_handler
+
+                    should_bypass = bool(
+                        get_plugin_command_handler(cmd.replace("_", "-"))
+                    )
+                except Exception:
+                    should_bypass = False
+
+            if should_bypass:
                 # /stop, /new, /reset must cancel the in-flight adapter task
                 # and preserve ordering of queued follow-ups.  Route those
                 # through the dedicated handoff path that serializes

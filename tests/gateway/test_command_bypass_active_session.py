@@ -13,6 +13,7 @@ the safety net in _run_agent discards leaked command text.
 """
 
 import asyncio
+from unittest.mock import patch
 
 import pytest
 
@@ -183,6 +184,22 @@ class TestCommandBypassActiveSession:
 
         assert sk not in adapter._pending_messages
         assert any("handled:tasks" in r for r in adapter.sent_responses)
+
+    @pytest.mark.asyncio
+    async def test_plugin_command_bypasses_guard(self):
+        """Registered plugin commands must remain callable during an active turn."""
+        adapter = _make_adapter()
+        sk = _session_key()
+        adapter._active_sessions[sk] = asyncio.Event()
+
+        with patch(
+            "hermes_cli.plugins.get_plugin_command_handler",
+            lambda name: (lambda args: args) if name == "taskcard" else None,
+        ):
+            await adapter.handle_message(_make_event("/taskcard refresh"))
+
+        assert sk not in adapter._pending_messages
+        assert any("handled:taskcard" in r for r in adapter.sent_responses)
 
     @pytest.mark.asyncio
     async def test_background_bypasses_guard(self):

@@ -1,0 +1,7 @@
+name: task-card
+version: "0.1.0"
+description: "Persist and update a topic-bound live task card from Hermes gateway lifecycle events."
+author: "Hermes Agent"
+kind: standalone
+provides_hooks:
+  - gateway_activity

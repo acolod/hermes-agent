@@ -34,6 +34,7 @@ so plugin-defined tools appear alongside the built-in tools.
 from __future__ import annotations
 
 import asyncio
+import functools
 import importlib.metadata
 import importlib.util
 import inspect
@@ -74,6 +75,214 @@ class PluginToolOverrideError(PermissionError):
     """Raised when a plugin attempts to override a built-in tool without
     operator opt-in via ``plugins.entries.<plugin_id>.allow_tool_override``.
     """
+
+
+@dataclass(frozen=True)
+class PluginCommandOrigin:
+    """Sanitized origin metadata passed to contextual slash-command handlers.
+
+    The object intentionally carries only the narrow, stable identifiers a
+    plugin needs to scope status updates or per-chat state. It avoids exposing
+    live adapter/session objects, which keeps handlers serializable and safe to
+    log or persist.
+    """
+
+    platform: Optional[str] = None
+    chat_id: Optional[str] = None
+    thread_id: Optional[str] = None
+    user_id: Optional[str] = None
+    profile: Optional[str] = None
+    session_key: Optional[str] = None
+    chat_type: Optional[str] = None
+
+
+@dataclass(frozen=True, slots=True)
+class PluginStatusPublisher:
+    """Lightweight wrapper for platform-neutral status upserts.
+
+    Plugin code receives this origin-bound wrapper instead of the adapter
+    itself. It can publish only to the invoking chat/thread, with revision and
+    no-op handling delegated to the platform-neutral adapter contract.
+    """
+
+    chat_id: Optional[str]
+    thread_id: Optional[str]
+    _publish: Callable[..., Any] = field(repr=False, compare=False)
+    _routing_metadata: Dict[str, Any] = field(
+        default_factory=dict,
+        repr=False,
+        compare=False,
+    )
+
+    async def upsert_status(
+        self,
+        status_key: str,
+        content: str,
+        *,
+        revision: Optional[int] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        publish_metadata = dict(metadata or {})
+        publish_metadata.update(self._routing_metadata)
+        if self.thread_id is not None:
+            publish_metadata["thread_id"] = self.thread_id
+        else:
+            publish_metadata.pop("thread_id", None)
+        return await self._publish(
+            status_key,
+            content,
+            revision=revision,
+            metadata=publish_metadata or None,
+        )
+
+
+@dataclass(frozen=True)
+class PluginCommandContext:
+    """Context bundle passed to contextual plugin slash-command handlers."""
+
+    command: str
+    raw_args: str
+    origin: PluginCommandOrigin = field(default_factory=PluginCommandOrigin)
+    status: Optional[PluginStatusPublisher] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+def _sanitize_origin_value(value: Any, *, limit: int = 256) -> Optional[str]:
+    """Return a bounded scalar identifier safe to expose to plugin handlers."""
+
+    value = getattr(value, "value", value)
+    if value is None or isinstance(value, bool) or not isinstance(value, (str, int)):
+        return None
+    text = "".join(" " if ord(char) < 32 or ord(char) == 127 else char for char in str(value))
+    text = text.strip()
+    return text[:limit] or None
+
+
+def build_plugin_command_context(
+    *,
+    command: str,
+    raw_args: str,
+    source: Any = None,
+    session_key: Optional[str] = None,
+    adapter: Any = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    status_metadata: Optional[Dict[str, Any]] = None,
+    platform: Optional[str] = None,
+    chat_id: Optional[str] = None,
+    thread_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    profile: Optional[str] = None,
+    chat_type: Optional[str] = None,
+) -> PluginCommandContext:
+    """Build a sanitized plugin-command context from live gateway/session state."""
+
+    source_platform = getattr(source, "platform", None) if source is not None else None
+    source_chat_id = getattr(source, "chat_id", None) if source is not None else None
+    source_thread_id = getattr(source, "thread_id", None) if source is not None else None
+    source_user_id = None
+    if source is not None:
+        source_user_id = getattr(source, "user_id_alt", None) or getattr(source, "user_id", None)
+    origin = PluginCommandOrigin(
+        platform=_sanitize_origin_value(source_platform) or _sanitize_origin_value(platform),
+        chat_id=_sanitize_origin_value(source_chat_id) or _sanitize_origin_value(chat_id),
+        thread_id=_sanitize_origin_value(source_thread_id) or _sanitize_origin_value(thread_id),
+        user_id=_sanitize_origin_value(source_user_id) or _sanitize_origin_value(user_id),
+        profile=_sanitize_origin_value(getattr(source, "profile", None) if source is not None else None)
+        or _sanitize_origin_value(profile),
+        session_key=_sanitize_origin_value(session_key),
+        chat_type=_sanitize_origin_value(getattr(source, "chat_type", None) if source is not None else None)
+        or _sanitize_origin_value(chat_type),
+    )
+    status = None
+    if adapter is not None and origin.chat_id is not None:
+        publisher = getattr(adapter, "upsert_status", None)
+        if callable(publisher):
+            status = PluginStatusPublisher(
+                chat_id=origin.chat_id,
+                thread_id=origin.thread_id,
+                _publish=functools.partial(publisher, origin.chat_id),
+                _routing_metadata=dict(status_metadata or {}),
+            )
+    return PluginCommandContext(
+        command=command,
+        raw_args=raw_args,
+        origin=origin,
+        status=status,
+        metadata=dict(metadata or {}),
+    )
+
+
+def _handler_accepts_context(handler: Callable[..., Any]) -> bool:
+    try:
+        signature = inspect.signature(handler)
+    except (TypeError, ValueError):
+        return False
+    params = list(signature.parameters.values())
+    if any(param.kind == inspect.Parameter.VAR_POSITIONAL for param in params):
+        return True
+    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params):
+        return True
+    positional = [
+        param for param in params
+        if param.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    if any(param.name == "context" for param in positional[1:]):
+        return True
+    return any(
+        param.kind == inspect.Parameter.KEYWORD_ONLY and param.name == "context"
+        for param in params
+    )
+
+
+def invoke_plugin_command_handler(
+    handler: Callable[..., Any],
+    raw_args: str,
+    *,
+    context: Optional[PluginCommandContext] = None,
+) -> Any:
+    """Call a plugin command handler with legacy or contextual arguments.
+
+    Existing handlers keep receiving ``raw_args`` only. Handlers that explicitly
+    declare a positional or keyword-only ``context`` parameter, ``*args``, or
+    ``**kwargs`` receive the richer context object as well.
+    """
+
+    if context is None or not _handler_accepts_context(handler):
+        return handler(raw_args)
+
+    try:
+        signature = inspect.signature(handler)
+    except (TypeError, ValueError):
+        return handler(raw_args)
+
+    params = list(signature.parameters.values())
+    context_param = signature.parameters.get("context")
+    if context_param is not None:
+        if context_param.kind != inspect.Parameter.POSITIONAL_ONLY:
+            return handler(raw_args, context=context)
+        positional = [
+            param
+            for param in params
+            if param.kind
+            in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            )
+        ]
+        context_index = positional.index(context_param)
+        args: List[Any] = [raw_args]
+        for param in positional[1:context_index]:
+            if param.default is inspect.Parameter.empty:
+                return handler(raw_args)
+            args.append(param.default)
+        args.append(context)
+        return handler(*args)
+    if any(
+        param.kind == inspect.Parameter.VAR_KEYWORD
+        for param in params
+    ):
+        return handler(raw_args, context=context)
+    return handler(raw_args, context)
 
 
 logger = logging.getLogger(__name__)
@@ -171,6 +380,11 @@ VALID_HOOKS: Set[str] = {
     #   {"action": "allow"}  /  None             -> normal dispatch
     # Kwargs: event: MessageEvent, gateway: GatewayRunner, session_store.
     "pre_gateway_dispatch",
+    # Gateway activity observer. Fired for minimal foreground/background
+    # start and terminal transitions. Receives only a sanitized contextual
+    # command capability plus a bounded lifecycle snapshot; no live gateway or
+    # adapter object is exposed to plugins.
+    "gateway_activity",
     # Approval lifecycle hooks. Fired by tools/approval.py when a dangerous
     # command needs an approval decision -- fires for CLI-interactive prompts,
     # gateway/ACP approvals, and smart-mode auxiliary-LLM decisions.

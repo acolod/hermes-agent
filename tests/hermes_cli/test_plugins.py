@@ -12,14 +12,19 @@ import yaml
 from hermes_cli.plugins import (
     ENTRY_POINTS_GROUP,
     VALID_HOOKS,
+    PluginCommandContext,
+    PluginCommandOrigin,
+    PluginStatusPublisher,
     PluginContext,
     PluginManager,
     PluginManifest,
+    build_plugin_command_context,
     get_plugin_command_handler,
     get_plugin_commands,
     get_pre_tool_call_block_message,
     get_pre_verify_continue_message,
     has_middleware,
+    invoke_plugin_command_handler,
     resolve_plugin_command_result,
 )
 from hermes_cli.middleware import (
@@ -1912,6 +1917,250 @@ class TestPluginCommands:
             assert "cmd-a" in cmds
             assert "cmd-b" in cmds
             assert cmds["cmd-a"]["description"] == "A"
+
+    def test_invoke_plugin_command_handler_passes_context_when_supported(self):
+        """Contextual handlers receive the sanitized command context."""
+        seen: dict[str, object] = {}
+
+        def handler(raw_args, context):
+            seen["raw_args"] = raw_args
+            seen["context"] = context
+            return f"{raw_args}:{context.origin.platform}:{context.origin.chat_id}"
+
+        context = PluginCommandContext(
+            command="taskcard",
+            raw_args="refresh",
+            origin=PluginCommandOrigin(platform="telegram", chat_id="chat-1"),
+            metadata={"phase": "start"},
+        )
+
+        result = invoke_plugin_command_handler(handler, "refresh", context=context)
+
+        assert result == "refresh:telegram:chat-1"
+        assert seen["raw_args"] == "refresh"
+        assert seen["context"] is context
+
+    def test_invoke_plugin_command_handler_preserves_legacy_handlers(self):
+        """Handlers that only accept raw_args continue to work unchanged."""
+        context = PluginCommandContext(
+            command="taskcard",
+            raw_args="refresh",
+            origin=PluginCommandOrigin(platform="telegram", chat_id="chat-1"),
+        )
+
+        def handler(raw_args):
+            return raw_args.upper()
+
+        assert invoke_plugin_command_handler(handler, "refresh", context=context) == "REFRESH"
+
+    def test_invoke_plugin_command_handler_preserves_legacy_optional_parameter(self):
+        """An unrelated optional positional parameter keeps its legacy default."""
+        context = PluginCommandContext(command="taskcard", raw_args="refresh")
+
+        def handler(raw_args, output_format="text"):
+            return f"{raw_args}:{output_format}"
+
+        assert invoke_plugin_command_handler(handler, "refresh", context=context) == "refresh:text"
+
+    def test_invoke_plugin_command_handler_names_context_after_optional_parameter(self):
+        """A named context must not displace an earlier optional parameter."""
+        context = PluginCommandContext(command="example", raw_args="refresh")
+
+        def handler(raw_args, output_format="text", context=None):
+            return raw_args, output_format, context
+
+        assert invoke_plugin_command_handler(handler, "refresh", context=context) == (
+            "refresh",
+            "text",
+            context,
+        )
+
+    def test_invoke_plugin_command_handler_preserves_uninspectable_legacy_handler(
+        self, monkeypatch
+    ):
+        """Signature lookup failure must preserve the historical one-argument call."""
+        context = PluginCommandContext(command="taskcard", raw_args="refresh")
+
+        def handler(raw_args):
+            return raw_args.upper()
+
+        def unavailable_signature(_handler):
+            raise ValueError("uninspectable")
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.inspect.signature",
+            unavailable_signature,
+        )
+
+        assert invoke_plugin_command_handler(handler, "refresh", context=context) == "REFRESH"
+
+    def test_invoke_plugin_command_handler_passes_context_to_kwargs_handler(self):
+        """Handlers using **kwargs receive context as a keyword, not a positional arg."""
+        seen = {}
+
+        def handler(raw_args, **kwargs):
+            seen.update(kwargs)
+            return raw_args
+
+        context = PluginCommandContext(command="taskcard", raw_args="refresh")
+
+        assert invoke_plugin_command_handler(handler, "refresh", context=context) == "refresh"
+        assert seen == {"context": context}
+
+    def test_build_plugin_command_context_sanitizes_source_and_binds_status(self):
+        """Gateway sources become a narrow origin snapshot plus a status helper."""
+        source = types.SimpleNamespace(
+            platform=types.SimpleNamespace(value="telegram"),
+            chat_id="chat-1",
+            thread_id="thread-9",
+            user_id="user-1",
+            user_id_alt=None,
+            profile="default",
+            chat_type="group",
+        )
+        class Adapter:
+            async def upsert_status(self, *args, **kwargs):
+                return None
+
+        adapter = Adapter()
+
+        context = build_plugin_command_context(
+            command="taskcard",
+            raw_args="refresh",
+            source=source,
+            session_key="session-42",
+            adapter=adapter,
+            metadata={"phase": "start"},
+        )
+
+        assert context.origin.platform == "telegram"
+        assert context.origin.chat_id == "chat-1"
+        assert context.origin.thread_id == "thread-9"
+        assert context.origin.user_id == "user-1"
+        assert context.origin.profile == "default"
+        assert context.origin.session_key == "session-42"
+        assert context.origin.chat_type == "group"
+        assert isinstance(context.status, PluginStatusPublisher)
+        assert context.status.chat_id == "chat-1"
+        assert context.status.thread_id == "thread-9"
+        assert not hasattr(context.status, "adapter")
+        assert context.metadata == {"phase": "start"}
+
+    def test_build_plugin_command_context_sanitizes_untrusted_origin_values(self):
+        """Origin values are scalar, control-free, and bounded before plugins see them."""
+        source = types.SimpleNamespace(
+            platform=types.SimpleNamespace(value="telegram\nsecret"),
+            chat_id="chat\x00-1",
+            thread_id="t" * 600,
+            user_id=object(),
+            user_id_alt=None,
+            profile="default\rprofile",
+            chat_type="group",
+        )
+
+        context = build_plugin_command_context(
+            command="taskcard",
+            raw_args="refresh",
+            source=source,
+            session_key="session\n42",
+        )
+
+        assert context.origin.platform == "telegram secret"
+        assert context.origin.chat_id == "chat -1"
+        assert context.origin.thread_id == "t" * 256
+        assert context.origin.user_id is None
+        assert context.origin.profile == "default profile"
+        assert context.origin.session_key == "session 42"
+
+    @pytest.mark.asyncio
+    async def test_status_publisher_forwards_bounded_origin_and_revision(self):
+        """Plugins can upsert status without receiving the live adapter object."""
+        calls = []
+
+        async def publish(status_key, content, *, revision=None, metadata=None):
+            calls.append((status_key, content, revision, metadata))
+            return "ok"
+
+        publisher = PluginStatusPublisher(
+            chat_id="chat-1",
+            thread_id="thread-9",
+            _publish=publish,
+        )
+
+        result = await publisher.upsert_status(
+            "taskcard",
+            "working",
+            revision=7,
+            metadata={"notify": False},
+        )
+
+        assert result == "ok"
+        assert calls == [
+            (
+                "taskcard",
+                "working",
+                7,
+                {"notify": False, "thread_id": "thread-9"},
+            )
+        ]
+
+    @pytest.mark.asyncio
+    async def test_status_publisher_cannot_override_bound_thread(self):
+        """Plugin metadata cannot redirect a status outside the invoking thread."""
+        calls = []
+
+        async def publish(status_key, content, *, revision=None, metadata=None):
+            calls.append(metadata)
+            return "ok"
+
+        publisher = PluginStatusPublisher(
+            chat_id="chat-1",
+            thread_id="thread-9",
+            _publish=publish,
+        )
+
+        await publisher.upsert_status(
+            "taskcard",
+            "working",
+            metadata={"thread_id": "other-thread", "notify": False},
+        )
+
+        assert calls == [{"thread_id": "thread-9", "notify": False}]
+
+    @pytest.mark.asyncio
+    async def test_status_publisher_preserves_all_bound_routing_metadata(self):
+        """Plugins cannot replace workspace/topic routing chosen by the gateway."""
+        calls = []
+
+        async def publish(status_key, content, *, revision=None, metadata=None):
+            calls.append(metadata)
+            return "ok"
+
+        publisher = PluginStatusPublisher(
+            chat_id="channel-1",
+            thread_id="thread-9",
+            _publish=publish,
+            _routing_metadata={
+                "thread_id": "thread-9",
+                "slack_team_id": "team-1",
+                "reply_to_message_id": "event-1",
+            },
+        )
+
+        await publisher.upsert_status(
+            "taskcard",
+            "working",
+            metadata={"slack_team_id": "other-team", "notify": False},
+        )
+
+        assert calls == [
+            {
+                "slack_team_id": "team-1",
+                "notify": False,
+                "thread_id": "thread-9",
+                "reply_to_message_id": "event-1",
+            }
+        ]
 
     def test_get_plugin_command_handler_discovers_plugins_lazily(self, tmp_path, monkeypatch):
         """Handler lookup should work before any explicit discover_plugins() call."""

@@ -160,3 +160,63 @@ async def test_distinct_chat_ids_do_not_collide(adapter):
     adapter.edit_message.assert_not_awaited()
     assert adapter._status_message_ids[("chat-1", "lifecycle")] == "100"
     assert adapter._status_message_ids[("chat-2", "lifecycle")] == "200"
+
+
+@pytest.mark.asyncio
+async def test_distinct_thread_ids_do_not_collide(adapter):
+    """The same card key in separate topics must own separate messages."""
+    adapter.send.side_effect = [
+        SendResult(success=True, message_id="100"),
+        SendResult(success=True, message_id="200"),
+    ]
+
+    await adapter.send_or_update_status(
+        "chat-1", "taskcard", "topic one", metadata={"thread_id": "thread-1"}
+    )
+    await adapter.send_or_update_status(
+        "chat-1", "taskcard", "topic two", metadata={"thread_id": "thread-2"}
+    )
+
+    assert adapter.send.await_count == 2
+    adapter.edit_message.assert_not_awaited()
+    assert adapter._status_message_ids[("chat-1", "thread-1", "taskcard")] == "100"
+    assert adapter._status_message_ids[("chat-1", "thread-2", "taskcard")] == "200"
+
+
+@pytest.mark.asyncio
+async def test_status_message_cache_is_bounded(adapter):
+    """Unique status keys evict the oldest cached Telegram message binding."""
+    adapter._status_message_cache_max = 2
+    adapter.send.side_effect = [
+        SendResult(success=True, message_id="100"),
+        SendResult(success=True, message_id="200"),
+        SendResult(success=True, message_id="300"),
+    ]
+
+    await adapter.send_or_update_status("chat-1", "status-1", "one")
+    await adapter.send_or_update_status("chat-1", "status-2", "two")
+    await adapter.send_or_update_status("chat-1", "status-3", "three")
+
+    assert len(adapter._status_message_ids) == 2
+    assert ("chat-1", "status-1") not in adapter._status_message_ids
+
+
+@pytest.mark.asyncio
+async def test_persisted_status_message_id_recovers_edit_after_restart(adapter):
+    """A persisted binding edits the prior bubble when the cache starts empty."""
+    adapter.edit_message.return_value = SendResult(success=True, message_id="100")
+
+    result = await adapter.send_or_update_status(
+        "chat-1",
+        "taskcard",
+        "recovered",
+        metadata={
+            "thread_id": "thread-1",
+            "status_message_id": "100",
+        },
+    )
+
+    assert result.success is True
+    adapter.send.assert_not_awaited()
+    adapter.edit_message.assert_awaited_once()
+    assert adapter.edit_message.call_args.args[1] == "100"

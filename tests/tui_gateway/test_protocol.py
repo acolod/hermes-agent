@@ -1363,6 +1363,7 @@ def test_slash_exec_routes_custom_skill_bundle_away_from_worker(server):
 def test_slash_exec_handles_plugin_commands_in_live_gateway(server):
     """Plugin slash commands return normal slash.exec output without using the worker."""
     sid = "test-session"
+    seen = {}
 
     class Worker:
         def __init__(self):
@@ -1375,9 +1376,13 @@ def test_slash_exec_handles_plugin_commands_in_live_gateway(server):
     worker = Worker()
     server._sessions[sid] = {"session_key": sid, "agent": None, "slash_worker": worker}
 
+    def handler(arg, context):
+        seen["context"] = context
+        return f"plugin:{arg}"
+
     with patch(
         "hermes_cli.plugins.get_plugin_command_handler",
-        lambda name: (lambda arg: f"plugin:{arg}") if name == "plugin-cmd" else None,
+        lambda name: handler if name == "plugin-cmd" else None,
     ):
         resp = server.handle_request({
             "id": "r-plugin-slash",
@@ -1387,6 +1392,9 @@ def test_slash_exec_handles_plugin_commands_in_live_gateway(server):
 
     assert "error" not in resp
     assert resp["result"] == {"output": "plugin:hello"}
+    assert seen["context"].origin.platform == "tui"
+    assert seen["context"].origin.session_key == sid
+    assert seen["context"].metadata == {"surface": "tui"}
     assert worker.calls == []
 
 

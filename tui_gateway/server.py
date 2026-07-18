@@ -11970,13 +11970,28 @@ def _(rid, params: dict) -> dict:
 
     try:
         from hermes_cli.plugins import (
+            build_plugin_command_context,
             get_plugin_command_handler,
+            invoke_plugin_command_handler,
             resolve_plugin_command_result,
         )
 
         handler = get_plugin_command_handler(name)
         if handler:
-            result = resolve_plugin_command_result(handler(arg))
+            plugin_context = build_plugin_command_context(
+                command=name,
+                raw_args=arg,
+                session_key=str(session.get("session_key", "") or "") if session else None,
+                platform=_session_source(session),
+                chat_id=session.get("chat_id") if session else None,
+                thread_id=session.get("thread_id") if session else None,
+                user_id=session.get("user_id") if session else None,
+                profile=session.get("profile") if session else None,
+                metadata={"surface": "tui"},
+            )
+            result = resolve_plugin_command_result(
+                invoke_plugin_command_handler(handler, arg, context=plugin_context)
+            )
             return _ok(rid, {"type": "plugin", "output": str(result or "")})
     except Exception:
         pass
@@ -13299,7 +13314,9 @@ def _(rid, params: dict) -> dict:
     if _cmd_base:
         try:
             from hermes_cli.plugins import (
+                build_plugin_command_context,
                 get_plugin_command_handler,
+                invoke_plugin_command_handler,
                 resolve_plugin_command_result,
             )
 
@@ -13310,7 +13327,20 @@ def _(rid, params: dict) -> dict:
 
     if plugin_handler and resolve_plugin_command_result:
         try:
-            result = resolve_plugin_command_result(plugin_handler(_cmd_arg))
+            plugin_context = build_plugin_command_context(
+                command=_cmd_base,
+                raw_args=_cmd_arg,
+                session_key=session.get("session_key", "") if session else None,
+                platform=_session_source(session),
+                chat_id=session.get("chat_id") if session else None,
+                thread_id=session.get("thread_id") if session else None,
+                user_id=session.get("user_id") if session else None,
+                profile=session.get("profile") if session else None,
+                metadata={"surface": "tui"},
+            )
+            result = resolve_plugin_command_result(
+                invoke_plugin_command_handler(plugin_handler, _cmd_arg, context=plugin_context)
+            )
             return _ok(rid, {"output": str(result or "(no output)")})
         except Exception as e:
             return _ok(rid, {"output": f"Plugin command error: {e}"})

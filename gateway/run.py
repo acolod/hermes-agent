@@ -9442,6 +9442,53 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _denied is not None:
                     return _denied
 
+            # Contextual plugin commands are control-plane capabilities too.
+            # Dispatch them directly while a turn is active rather than
+            # feeding them into the queue/steer/interrupt policy as user text.
+            if _evt_cmd and _cmd_def_inner is None:
+                try:
+                    from hermes_cli.plugins import (
+                        build_plugin_command_context,
+                        get_plugin_command_handler,
+                        invoke_plugin_command_handler,
+                    )
+
+                    _plugin_name = _evt_cmd.replace("_", "-")
+                    _plugin_handler = get_plugin_command_handler(_plugin_name)
+                    if _plugin_handler is not None:
+                        _denied = self._check_slash_access(source, _plugin_name)
+                        if _denied is not None:
+                            return _denied
+                        _thread_metadata = self._thread_metadata_for_source(
+                            source,
+                            getattr(event, "message_id", None),
+                        )
+                        _plugin_context = build_plugin_command_context(
+                            command=_plugin_name,
+                            raw_args=event.get_command_args().strip(),
+                            source=source,
+                            session_key=str(_quick_key or ""),
+                            adapter=self._adapter_for_source(source),
+                            thread_id=(_thread_metadata or {}).get("thread_id"),
+                            status_metadata=_thread_metadata,
+                            metadata={"surface": "gateway"},
+                        )
+                        _plugin_result = invoke_plugin_command_handler(
+                            _plugin_handler,
+                            event.get_command_args().strip(),
+                            context=_plugin_context,
+                        )
+                        if asyncio.iscoroutine(_plugin_result):
+                            _plugin_result = await _plugin_result
+                        return str(_plugin_result) if _plugin_result else None
+                except Exception as exc:
+                    logger.warning(
+                        "Plugin command /%s failed during active turn: %s",
+                        _evt_cmd,
+                        exc,
+                    )
+                    return f"Plugin command error: {exc}"
+
             # Telegram sends /start for bot launches/deep-links. Treat it as a
             # platform ping, not a user command: no help dump, no agent
             # interrupt, no queued text.
@@ -10269,14 +10316,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Plugin-registered slash commands
         if command:
             try:
-                from hermes_cli.plugins import get_plugin_command_handler
+                from hermes_cli.plugins import (
+                    build_plugin_command_context,
+                    get_plugin_command_handler,
+                    invoke_plugin_command_handler,
+                )
+                session_key = str(_quick_key or "")
                 # Normalize underscores to hyphens so Telegram's underscored
                 # autocomplete form matches plugin commands registered with
                 # hyphens. See hermes_cli/commands.py:_build_telegram_menu.
-                plugin_handler = get_plugin_command_handler(command.replace("_", "-"))
+                plugin_name = command.replace("_", "-")
+                plugin_handler = get_plugin_command_handler(plugin_name)
                 if plugin_handler:
                     user_args = event.get_command_args().strip()
-                    result = plugin_handler(user_args)
+                    plugin_thread_metadata = self._thread_metadata_for_source(
+                        source,
+                        getattr(event, "message_id", None),
+                    )
+                    plugin_context = build_plugin_command_context(
+                        command=plugin_name,
+                        raw_args=user_args,
+                        source=source,
+                        session_key=session_key,
+                        adapter=self._adapter_for_source(source),
+                        thread_id=(plugin_thread_metadata or {}).get("thread_id"),
+                        status_metadata=plugin_thread_metadata,
+                        metadata={"surface": "gateway"},
+                    )
+                    result = invoke_plugin_command_handler(
+                        plugin_handler,
+                        user_args,
+                        context=plugin_context,
+                    )
                     if asyncio.iscoroutine(result):
                         result = await result
                     return str(result) if result else None
@@ -13621,6 +13692,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adapter = self._adapter_for_source(source)
         if not adapter:
             logger.warning("No adapter for platform %s in background task %s", source.platform, task_id)
+            self._emit_gateway_activity(
+                source=source,
+                session_key=self._session_key_for_source(source),
+                kind="background",
+                phase="failed",
+                status="failed",
+                summary="Background task failed: no adapter",
+                terminal=True,
+                task_id=task_id,
+                event_message_id=event_message_id,
+            )
             return
 
         _thread_metadata = self._thread_metadata_for_source(source, event_message_id)
@@ -13636,6 +13718,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     source.chat_id,
                     f"❌ Background task {task_id} failed: no provider credentials configured.",
                     metadata=_thread_metadata,
+                )
+                self._emit_gateway_activity(
+                    source=source,
+                    session_key=self._session_key_for_source(source),
+                    kind="background",
+                    phase="failed",
+                    status="failed",
+                    summary="Background task failed: no provider credentials",
+                    terminal=True,
+                    task_id=task_id,
+                    event_message_id=event_message_id,
                 )
                 return
 
@@ -13797,8 +13890,55 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     metadata=_thread_metadata,
                 )
 
+            background_failed = bool(
+                isinstance(result, dict)
+                and (
+                    result.get("failed")
+                    or (result.get("error") and not result.get("completed"))
+                )
+            )
+            self._emit_gateway_activity(
+                source=source,
+                session_key=self._session_key_for_source(source),
+                kind="background",
+                phase="failed" if background_failed else "completed",
+                status="failed" if background_failed else "completed",
+                summary=(
+                    "Background task failed"
+                    if background_failed
+                    else "Background task completed"
+                ),
+                terminal=True,
+                task_id=task_id,
+                event_message_id=event_message_id,
+            )
+
+        except asyncio.CancelledError:
+            self._emit_gateway_activity(
+                source=source,
+                session_key=self._session_key_for_source(source),
+                kind="background",
+                phase="cancelled",
+                status="cancelled",
+                summary="Background task cancelled",
+                terminal=True,
+                task_id=task_id,
+                event_message_id=event_message_id,
+            )
+            raise
         except Exception as e:
             logger.exception("Background task %s failed", task_id)
+            self._emit_gateway_activity(
+                source=source,
+                session_key=self._session_key_for_source(source),
+                kind="background",
+                phase="failed",
+                status="failed",
+                summary="Background task failed",
+                terminal=True,
+                task_id=task_id,
+                event_message_id=event_message_id,
+            )
             try:
                 await adapter.send(
                     chat_id=source.chat_id,
@@ -17321,6 +17461,59 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     # ------------------------------------------------------------------
 
+    def _emit_gateway_activity(
+        self,
+        *,
+        source: SessionSource,
+        session_key: Optional[str],
+        kind: str,
+        phase: str,
+        status: str,
+        summary: str,
+        terminal: bool,
+        task_id: Optional[str] = None,
+        event_message_id: Optional[str] = None,
+    ) -> None:
+        """Emit a bounded lifecycle observation to contextual plugins."""
+        try:
+            from hermes_cli.plugins import build_plugin_command_context, invoke_hook
+
+            snapshot: Dict[str, Any] = {
+                "kind": str(kind)[:64],
+                "phase": str(phase)[:64],
+                "status": str(status)[:64],
+                "summary": str(summary)[:256],
+                "terminal": bool(terminal),
+            }
+            if task_id:
+                snapshot["task_id"] = str(task_id)[:128]
+            thread_metadata = self._thread_metadata_for_source(
+                source,
+                event_message_id,
+            )
+            context = build_plugin_command_context(
+                command="gateway_activity",
+                raw_args="",
+                source=source,
+                session_key=session_key,
+                adapter=self._adapter_for_source(source),
+                thread_id=(thread_metadata or {}).get("thread_id"),
+                status_metadata=thread_metadata,
+                metadata={
+                    "surface": "gateway_activity",
+                    "kind": snapshot["kind"],
+                    **({"task_id": snapshot["task_id"]} if "task_id" in snapshot else {}),
+                },
+            )
+            invoke_hook(
+                "gateway_activity",
+                context=context,
+                activity_snapshot=snapshot,
+                terminal=bool(terminal),
+            )
+        except Exception as exc:
+            logger.warning("gateway_activity hook invocation failed: %s", exc)
+
     async def _run_agent(
         self,
         message: str,
@@ -17346,26 +17539,87 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         multiplexing is off this is a transparent pass-through — zero behavior
         change for single-profile gateways.
         """
-        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
-            return await self._run_agent_inner(
-                message, context_prompt, history, source, session_id,
-                session_key=session_key, run_generation=run_generation,
-                _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
-                channel_prompt=channel_prompt, moa_config=moa_config,
-                persist_user_message=persist_user_message,
-                persist_user_timestamp=persist_user_timestamp,
+        self._emit_gateway_activity(
+            source=source,
+            session_key=session_key,
+            kind="foreground",
+            phase="foreground-start",
+            status="running",
+            summary="Foreground task started",
+            terminal=False,
+            event_message_id=event_message_id,
+        )
+        try:
+            if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                result = await self._run_agent_inner(
+                    message, context_prompt, history, source, session_id,
+                    session_key=session_key, run_generation=run_generation,
+                    _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
+                    channel_prompt=channel_prompt, moa_config=moa_config,
+                    persist_user_message=persist_user_message,
+                    persist_user_timestamp=persist_user_timestamp,
+                )
+            else:
+                profile_home = self._resolve_profile_home_for_source(source)
+                with _profile_runtime_scope(profile_home):
+                    result = await self._run_agent_inner(
+                        message, context_prompt, history, source, session_id,
+                        session_key=session_key, run_generation=run_generation,
+                        _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
+                        channel_prompt=channel_prompt, moa_config=moa_config,
+                        persist_user_message=persist_user_message,
+                        persist_user_timestamp=persist_user_timestamp,
+                    )
+        except asyncio.CancelledError:
+            self._emit_gateway_activity(
+                source=source,
+                session_key=session_key,
+                kind="foreground",
+                phase="cancelled",
+                status="cancelled",
+                summary="Foreground task cancelled",
+                terminal=True,
+                event_message_id=event_message_id,
             )
+            raise
+        except Exception:
+            self._emit_gateway_activity(
+                source=source,
+                session_key=session_key,
+                kind="foreground",
+                phase="failed",
+                status="failed",
+                summary="Foreground task failed",
+                terminal=True,
+                event_message_id=event_message_id,
+            )
+            raise
 
-        profile_home = self._resolve_profile_home_for_source(source)
-        with _profile_runtime_scope(profile_home):
-            return await self._run_agent_inner(
-                message, context_prompt, history, source, session_id,
-                session_key=session_key, run_generation=run_generation,
-                _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
-                channel_prompt=channel_prompt, moa_config=moa_config,
-                persist_user_message=persist_user_message,
-                persist_user_timestamp=persist_user_timestamp,
+        interrupted = bool(isinstance(result, dict) and result.get("interrupted"))
+        failed = bool(
+            isinstance(result, dict)
+            and (
+                result.get("failed")
+                or result.get("partial")
+                or result.get("completed") is False
+                or (result.get("error") and not result.get("final_response"))
             )
+        )
+        self._emit_gateway_activity(
+            source=source,
+            session_key=session_key,
+            kind="foreground",
+            phase="cancelled" if interrupted else ("failed" if failed else "completed"),
+            status="cancelled" if interrupted else ("failed" if failed else "completed"),
+            summary=(
+                "Foreground task cancelled"
+                if interrupted
+                else ("Foreground task failed" if failed else "Foreground task completed")
+            ),
+            terminal=True,
+            event_message_id=event_message_id,
+        )
+        return result
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
         """Resolve the profile name for an inbound source via configured routes.
