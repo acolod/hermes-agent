@@ -361,6 +361,23 @@ def test_foreground_todo_creates_task_keyed_card_without_conversation_binding(tm
     assert manager.current_state("foreground:fg_alpha", state.topic_identity) == state
 
 
+def test_foreground_public_card_uses_todo_title_not_internal_task_id(tmp_path):
+    plugin = _load_plugin()
+    manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0)
+    state = manager.on_gateway_activity(
+        context=_context(),
+        activity_snapshot={
+            "kind": "foreground", "task_id": "fg_secret", "activity_id": "foreground:fg_secret",
+            "generation": "gen", "revision": 2, "phase": "working", "status": "running",
+            "task_items": [{"id": "one", "content": "Check gateway health", "status": "in_progress"}],
+        },
+    )
+
+    rendered = plugin.render_task_card(state)
+    assert "Check gateway health" in rendered
+    assert "fg_secret" not in rendered
+
+
 def test_foreground_without_todo_does_not_create_task_card(tmp_path):
     plugin = _load_plugin()
     manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0)
