@@ -19896,6 +19896,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "conversation_history": agent_history,
                     "task_id": session_id,
                 }
+                agent._task_card_turn_start_index = len(agent_history)
                 if _persist_user_message_override is not None:
                     _conversation_kwargs["persist_user_message"] = _persist_user_message_override
                 elif observed_group_context:
@@ -20153,11 +20154,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception:
                     pass
 
+            _turn_messages = (
+                result_holder[0].get("messages", []) if result_holder[0] else []
+            )
+            _turn_start_index = max(
+                0,
+                int(getattr(agent, "_task_card_turn_start_index", 0)),
+            )
+            _turn_messages = _turn_messages[_turn_start_index:]
             _todo_items = []
             _todo_observed = any(
                 isinstance(message, dict) and message.get("role") == "tool"
                 and "todo" in str(message.get("name") or "")
-                for message in (result_holder[0].get("messages", []) if result_holder[0] else [])
+                for message in _turn_messages
             )
             if _todo_observed:
                 _todo_store = getattr(agent, "_todo_store", None)

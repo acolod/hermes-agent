@@ -534,6 +534,26 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
     return sp
 
 
+def _previous_tools_since_turn(messages: List[Dict[str, Any]], turn_start: int) -> list[dict]:
+    """Return only the latest completed tool batch created in this turn."""
+    for message_index in range(len(messages) - 1, max(0, turn_start) - 1, -1):
+        message = messages[message_index]
+        if message.get("role") != "assistant" or not message.get("tool_calls"):
+            continue
+        results_by_id = {}
+        for tool_message in messages[message_index + 1:]:
+            if tool_message.get("role") != "tool":
+                break
+            tool_call_id = tool_message.get("tool_call_id")
+            if tool_call_id:
+                results_by_id[tool_call_id] = tool_message.get("content", "")
+        return [
+            {"name": call["function"]["name"], "result": results_by_id.get(call.get("id")), "arguments": call["function"].get("arguments")}
+            for call in message["tool_calls"] if isinstance(call, dict)
+        ]
+    return []
+
+
 def run_conversation(
     agent,
     user_message: Any,
@@ -612,6 +632,7 @@ def run_conversation(
     effective_task_id = _ctx.effective_task_id
     turn_id = _ctx.turn_id
     current_turn_user_idx = _ctx.current_turn_user_idx
+    agent._task_card_turn_start_index = current_turn_user_idx
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
@@ -684,27 +705,10 @@ def run_conversation(
         # Fire step_callback for gateway hooks (agent:step event)
         if agent.step_callback is not None:
             try:
-                prev_tools = []
-                for _idx, _m in enumerate(reversed(messages)):
-                    if _m.get("role") == "assistant" and _m.get("tool_calls"):
-                        _fwd_start = len(messages) - _idx
-                        _results_by_id = {}
-                        for _tm in messages[_fwd_start:]:
-                            if _tm.get("role") != "tool":
-                                break
-                            _tcid = _tm.get("tool_call_id")
-                            if _tcid:
-                                _results_by_id[_tcid] = _tm.get("content", "")
-                        prev_tools = [
-                            {
-                                "name": tc["function"]["name"],
-                                "result": _results_by_id.get(tc.get("id")),
-                                "arguments": tc["function"].get("arguments"),
-                            }
-                            for tc in _m["tool_calls"]
-                            if isinstance(tc, dict)
-                        ]
-                        break
+                prev_tools = _previous_tools_since_turn(
+                    messages,
+                    int(getattr(agent, "_task_card_turn_start_index", 0)),
+                )
                 agent.step_callback(api_call_count, prev_tools)
             except Exception as _step_err:
                 logger.debug("step_callback error (iteration %s): %s", api_call_count, _step_err)
