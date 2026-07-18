@@ -358,9 +358,13 @@ def render_task_card(state: TaskCardState) -> str:
     else:
         marker = "🔄"
     title = (
-        "Current conversation"
-        if _GENERATED_BINDING_RE.fullmatch(state.binding)
-        else state.binding
+        state.items[0].label[:80]
+        if state.binding.startswith("foreground:") and state.items
+        else (
+            "Current conversation"
+            if _GENERATED_BINDING_RE.fullmatch(state.binding)
+            else state.binding
+        )
     )
     if state.items:
         return "\n".join(

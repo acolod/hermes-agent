@@ -18133,6 +18133,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _cleanup_progress = False
             _cleanup_adapter = None
         _cleanup_msg_ids: List[str] = []
+        _task_card_active = [False]
         # First-touch onboarding latch: fires at most once per run, even if
         # several tools exceed the threshold.
         long_tool_hint_fired = [False]
@@ -18140,6 +18141,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
             """Callback invoked by agent on tool lifecycle events."""
+            if _task_card_active[0]:
+                return
             # "log" mode: append tool.started lines to the log queue and stay
             # silent in chat. Handled before the progress_queue guard because
             # log mode runs without a chat progress queue.
@@ -18795,6 +18798,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 _parsed = _raw
                             _todos = _parsed.get("todos") if isinstance(_parsed, dict) else None
                             if isinstance(_todos, list):
+                                _task_card_active[0] = True
                                 _loop_for_step.call_soon_threadsafe(
                                     lambda: self._emit_gateway_activity(
                                         source=source, session_key=session_key,
