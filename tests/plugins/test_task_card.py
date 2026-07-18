@@ -149,6 +149,94 @@ async def test_bind_persists_topic_identity_revision_and_content_hash(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_second_foreground_turn_reopens_terminal_card_on_same_message(tmp_path):
+    plugin = _load_plugin()
+
+    class FixedMessageStatus(_CaptureStatus):
+        async def upsert_status(self, *args, **kwargs):
+            result = await super().upsert_status(*args, **kwargs)
+            return SimpleNamespace(success=result.success, message_id="15438")
+
+    status = FixedMessageStatus()
+    manager = plugin.TaskCardManager(
+        plugin.TaskCardStore(tmp_path),
+        debounce_seconds=0,
+    )
+    context = _context(status=status)
+    manager.handle_command("bind Smoke test", context)
+    await manager.wait_for_publishes()
+
+    first_started = manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "foreground",
+            "phase": "foreground-start",
+            "status": "running",
+            "summary": "Foreground task started",
+            "terminal": False,
+        },
+    )
+    await manager.wait_for_publishes()
+    first_completed = manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "foreground",
+            "phase": "completed",
+            "status": "completed",
+            "summary": "Foreground task completed",
+            "terminal": True,
+        },
+    )
+    await manager.wait_for_publishes()
+    first_completed = manager.current_state("Smoke test", first_completed.topic_identity)
+
+    assert first_started is not None
+    assert first_completed is not None
+    assert first_completed.terminal is True
+    assert first_completed.revision == 3
+    assert first_completed.platform_message_id == "15438"
+    first_generation = first_completed.generation
+
+    second_started = manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "foreground",
+            "phase": "foreground-start",
+            "status": "running",
+            "summary": "Foreground task started",
+            "terminal": False,
+        },
+    )
+    await manager.wait_for_publishes()
+    second_completed = manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "foreground",
+            "phase": "completed",
+            "status": "completed",
+            "summary": "Foreground task completed",
+            "terminal": True,
+        },
+    )
+    await manager.wait_for_publishes()
+
+    assert second_started is not None
+    assert second_started.terminal is False
+    assert second_started.phase == "foreground-start"
+    assert second_started.generation != first_generation
+    assert second_started.revision == 1
+    assert second_started.platform_message_id == "15438"
+    assert second_completed is not None
+    assert second_completed.terminal is True
+    assert second_completed.phase == "completed"
+    assert second_completed.generation == second_started.generation
+    assert second_completed.revision == 2
+    assert second_completed.platform_message_id == "15438"
+    assert [call["revision"] for call in status.calls[-2:]] == [1, 2]
+    assert all(call["metadata"]["status_message_id"] == "15438" for call in status.calls[-2:])
+
+
+@pytest.mark.asyncio
 async def test_publish_retries_failure_and_persists_platform_message_binding(tmp_path):
     plugin = _load_plugin()
     status = _CaptureStatus([False, True])

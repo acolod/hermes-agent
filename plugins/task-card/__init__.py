@@ -29,6 +29,7 @@ TERMINAL_PHASES = {
     "failed",
     "ready_for_alex",
 }
+START_PHASES = {"background-start", "foreground-start"}
 PHASE_RANK = {
     "queued": 0,
     "command": 1,
@@ -213,17 +214,21 @@ def reduce_task_card_state(
 ) -> TaskCardState:
     event_hash = event.revision_hash()
     if previous is not None:
-        if previous.terminal or previous.revision_hash == event_hash:
-            return previous
-        if (
-            previous.activity_id
-            and event.activity_id
-            and previous.activity_id != event.activity_id
-        ):
-            return previous
-        if _phase_rank(event.phase) < _phase_rank(previous.phase) and not event.terminal:
-            return previous
-        revision = previous.revision + 1
+        same_generation = previous.generation == event.generation
+        if same_generation:
+            if previous.terminal or previous.revision_hash == event_hash:
+                return previous
+            if (
+                previous.activity_id
+                and event.activity_id
+                and previous.activity_id != event.activity_id
+            ):
+                return previous
+            if _phase_rank(event.phase) < _phase_rank(previous.phase) and not event.terminal:
+                return previous
+            revision = previous.revision + 1
+        else:
+            revision = 1
     else:
         revision = 1
 
@@ -708,6 +713,12 @@ class TaskCardManager:
             else bool(terminal)
         )
         is_terminal = is_terminal or phase in TERMINAL_PHASES
+        previous = self.current_state(binding, topic_identity)
+        generation = (
+            uuid.uuid4().hex
+            if phase in START_PHASES and previous is not None and previous.terminal
+            else None
+        )
         event = self._event(
             context,
             binding=binding,
@@ -716,6 +727,7 @@ class TaskCardManager:
             summary=str(activity.get("summary") or phase),
             activity_snapshot=activity,
             terminal=is_terminal,
+            generation=generation,
             activity_kind=activity_kind,
             activity_id=activity_id,
         )
