@@ -452,6 +452,7 @@ class TaskCardManager:
             "status": state.status,
             "terminal": state.terminal,
             "topic_identity": state.topic_identity,
+            "validate_edit_response": True,
         }
         if state.platform_message_id:
             metadata["status_message_id"] = state.platform_message_id

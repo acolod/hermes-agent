@@ -237,3 +237,106 @@ async def test_persisted_status_message_id_recovers_edit_after_restart(adapter, 
         and "disposition=success" in message
         for message in messages
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("returned_chat", "returned_message", "returned_text", "success", "reason"),
+    [
+        ("-5141963563", "15438", "Task Card rev 1", True, "validated"),
+        ("-1", "15438", "Task Card rev 1", False, "chat_mismatch"),
+        ("-5141963563", "999", "Task Card rev 1", False, "message_mismatch"),
+        ("-5141963563", "15438", "stale rev 3", False, "text_mismatch"),
+    ],
+)
+async def test_edit_message_validates_returned_message(
+    adapter,
+    caplog,
+    returned_chat,
+    returned_message,
+    returned_text,
+    success,
+    reason,
+):
+    """A Telegram edit is successful only when its returned Message matches."""
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    caplog.set_level("INFO")
+    adapter.edit_message = TelegramAdapter.edit_message.__get__(adapter, TelegramAdapter)
+    adapter._bot.edit_message_text = AsyncMock(
+        return_value=SimpleNamespace(
+            chat=SimpleNamespace(id=int(returned_chat)),
+            message_id=int(returned_message),
+            text=returned_text,
+        )
+    )
+
+    result = await adapter.edit_message(
+        "-5141963563",
+        "15438",
+        "Task Card rev 1",
+        finalize=True,
+        metadata={"validate_edit_response": True},
+    )
+
+    assert result.success is success
+    assert result.message_id == "15438"
+    assert result.raw_response["reason"] == reason
+    assert result.raw_response["expected_chat_id"] == "-5141963563"
+    assert result.raw_response["returned_chat_id"] == returned_chat
+    assert result.raw_response["expected_message_id"] == "15438"
+    assert result.raw_response["returned_message_id"] == returned_message
+    assert len(result.raw_response["expected_text_hash"]) == 64
+    assert len(result.raw_response["returned_text_hash"]) == 64
+    assert any(
+        "Telegram edit response validation" in record.getMessage()
+        and f"disposition={reason}" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_unverified_edit_does_not_create_replacement(adapter):
+    """A response mismatch must preserve the binding instead of sending anew."""
+    adapter.edit_message.return_value = SendResult(
+        success=False,
+        message_id="15438",
+        error="edit response text mismatch",
+        error_kind="edit_response_mismatch",
+    )
+
+    result = await adapter.send_or_update_status(
+        "-5141963563",
+        "taskcard",
+        "Task Card rev 1",
+        metadata={"status_message_id": "15438"},
+    )
+
+    assert result.success is False
+    assert result.message_id == "15438"
+    adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_normal_markdown_edit_does_not_require_task_card_validation(adapter):
+    """Strict response matching must not change ordinary Markdown delivery."""
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    adapter.edit_message = TelegramAdapter.edit_message.__get__(adapter, TelegramAdapter)
+    adapter._bot.edit_message_text = AsyncMock(
+        return_value=SimpleNamespace(
+            chat=SimpleNamespace(id=-5141963563),
+            message_id=15438,
+            text="bold",
+        )
+    )
+
+    result = await adapter.edit_message(
+        "-5141963563",
+        "15438",
+        "**bold**",
+        finalize=True,
+    )
+
+    assert result.success is True
+    assert result.raw_response is None

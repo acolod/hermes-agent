@@ -10,6 +10,7 @@ Uses python-telegram-bot library for:
 import asyncio
 import dataclasses
 import faulthandler
+import hashlib
 import inspect
 import json
 import logging
@@ -4274,12 +4275,77 @@ class TelegramAdapter(BasePlatformAdapter):
             if result.success:
                 _remember(result.message_id or cached_id)
                 return result
+            if result.error_kind == "edit_response_mismatch":
+                return result
             # Edit failed — clear the cached id and fall through to a fresh send.
             self._status_message_ids.pop(key, None)
         result = await self.send(chat_id, content, metadata=metadata)
         if result.success and result.message_id:
             _remember(result.message_id)
         return result
+
+    def _validate_edit_response(
+        self,
+        response: Any,
+        *,
+        chat_id: str,
+        message_id: str,
+        expected_text: str,
+    ) -> SendResult:
+        expected_chat = str(normalize_telegram_chat_id(chat_id))
+        expected_message = str(message_id)
+        returned_chat_obj = getattr(response, "chat", None)
+        returned_chat = getattr(returned_chat_obj, "id", None)
+        if returned_chat is None and str(chat_id).startswith("@"):
+            username = getattr(returned_chat_obj, "username", None)
+            returned_chat = f"@{username}" if username else None
+        returned_message = getattr(response, "message_id", None)
+        returned_text = getattr(response, "text", None)
+        expected_text_hash = hashlib.sha256(expected_text.encode("utf-8")).hexdigest()
+        returned_text_hash = hashlib.sha256(
+            (returned_text if isinstance(returned_text, str) else "").encode("utf-8")
+        ).hexdigest()
+
+        returned_chat_id = None if returned_chat is None else str(returned_chat)
+        returned_message_id = None if returned_message is None else str(returned_message)
+        if returned_chat_id != expected_chat:
+            reason = "chat_mismatch"
+        elif returned_message_id != expected_message:
+            reason = "message_mismatch"
+        elif returned_text_hash != expected_text_hash:
+            reason = "text_mismatch"
+        else:
+            reason = "validated"
+        success = reason == "validated"
+        details = {
+            "status": "success" if success else "error",
+            "reason": reason,
+            "expected_chat_id": expected_chat,
+            "returned_chat_id": returned_chat_id,
+            "expected_message_id": expected_message,
+            "returned_message_id": returned_message_id,
+            "expected_text_hash": expected_text_hash,
+            "returned_text_hash": returned_text_hash,
+        }
+        logger.info(
+            "Telegram edit response validation expected_chat_id=%s returned_chat_id=%s "
+            "expected_message_id=%s returned_message_id=%s expected_text_hash=%s "
+            "returned_text_hash=%s disposition=%s",
+            expected_chat,
+            returned_chat_id,
+            expected_message,
+            returned_message_id,
+            expected_text_hash,
+            returned_text_hash,
+            reason,
+        )
+        return SendResult(
+            success=success,
+            message_id=expected_message,
+            error=None if success else f"edit response {reason}",
+            raw_response=details,
+            error_kind=None if success else "edit_response_mismatch",
+        )
 
     async def edit_message(
         self,
@@ -4367,12 +4433,20 @@ class TelegramAdapter(BasePlatformAdapter):
 
             formatted = self.format_message(content)
             try:
-                await self._bot.edit_message_text(
+                edit_response = await self._bot.edit_message_text(
                     chat_id=normalize_telegram_chat_id(chat_id),
                     message_id=int(message_id),
                     text=formatted,
                     parse_mode=ParseMode.MARKDOWN_V2,
                 )
+                if (metadata or {}).get("validate_edit_response"):
+                    return self._validate_edit_response(
+                        edit_response,
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        expected_text=content,
+                    )
+                return SendResult(success=True, message_id=message_id)
             except Exception as fmt_err:
                 # "Message is not modified" is a no-op, not an error
                 if "not modified" in str(fmt_err).lower():
@@ -4389,12 +4463,19 @@ class TelegramAdapter(BasePlatformAdapter):
                     safe_format_error,
                 )
                 _plain = _strip_mdv2(content) if content else content
-                await self._bot.edit_message_text(
+                edit_response = await self._bot.edit_message_text(
                     chat_id=normalize_telegram_chat_id(chat_id),
                     message_id=int(message_id),
                     text=_plain,
                 )
-            return SendResult(success=True, message_id=message_id)
+                if (metadata or {}).get("validate_edit_response"):
+                    return self._validate_edit_response(
+                        edit_response,
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        expected_text=_plain,
+                    )
+                return SendResult(success=True, message_id=message_id)
         except Exception as e:
             err_str = str(e).lower()
             # "Message is not modified" — content identical, treat as success
