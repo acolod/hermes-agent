@@ -18810,10 +18810,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         event_message_id=event_message_id, task_items=_todos,
                                     )
                                 )
+                            else:
+                                logger.info("task-card todo disposition: task=%s no-list", task_card_task_id)
                         except Exception:
-                            logger.debug("task-card todo update extraction failed", exc_info=True)
+                            logger.info("task-card todo disposition: task=%s unparseable", task_card_task_id)
                 else:
                     _names.append(str(_t))
+            logger.info(
+                "task-card callback: task=%s iteration=%s payloads=%d tools=%s",
+                task_card_task_id, iteration, len(prev_tools or []), ",".join(_names),
+            )
+            if "todo" not in _names:
+                logger.info("task-card todo disposition: task=%s none", task_card_task_id)
             safe_schedule_threadsafe(
                 _hooks_ref.emit("agent:step", {
                     "platform": source.platform.value if source.platform else "",
