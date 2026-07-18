@@ -4275,6 +4275,9 @@ class TelegramAdapter(BasePlatformAdapter):
             if result.success:
                 _remember(result.message_id or cached_id)
                 return result
+            if (metadata or {}).get("preserve_status_message_id"):
+                _remember(cached_id)
+                return dataclasses.replace(result, message_id=str(cached_id))
             if result.error_kind == "edit_response_mismatch":
                 return result
             # Edit failed — clear the cached id and fall through to a fresh send.

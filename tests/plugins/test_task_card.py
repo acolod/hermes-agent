@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -271,6 +272,71 @@ async def test_publish_retries_failure_and_persists_platform_message_binding(tmp
     )
     await restarted.wait_for_publishes()
     assert restarted_status.calls[-1]["metadata"]["status_message_id"] == "message-2"
+
+
+@pytest.mark.asyncio
+async def test_publish_retry_preserves_message_and_honors_retry_after(tmp_path, monkeypatch):
+    plugin = _load_plugin()
+
+    class RetryAfterStatus(_CaptureStatus):
+        responses: list[Any]
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.responses = [SimpleNamespace(success=True, message_id="15499")]
+
+        async def upsert_status(self, *args, **kwargs):
+            self.calls.append({
+                "status_key": args[0],
+                "content": args[1],
+                "revision": kwargs.get("revision"),
+                "metadata": kwargs.get("metadata"),
+                "loop": asyncio.get_running_loop(),
+                "thread": threading.get_ident(),
+            })
+            return self.responses.pop(0)
+
+    status = RetryAfterStatus()
+    manager = plugin.TaskCardManager(
+        plugin.TaskCardStore(tmp_path),
+        debounce_seconds=0,
+        publish_retry_seconds=0.25,
+    )
+    context = _context(status=status)
+    manager.handle_command("bind Smoke test", context)
+    await manager.wait_for_publishes()
+
+    status.responses = [
+        SimpleNamespace(
+            success=False,
+            message_id="15499",
+            retry_after=2.0,
+        ),
+        SimpleNamespace(success=True, message_id="15499"),
+    ]
+    sleep = AsyncMock()
+    monkeypatch.setattr(plugin.asyncio, "sleep", sleep)
+    manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "foreground",
+            "phase": "foreground-start",
+            "status": "running",
+        },
+    )
+    await manager.wait_for_publishes()
+
+    assert [call["metadata"]["status_message_id"] for call in status.calls[-2:]] == [
+        "15499",
+        "15499",
+    ]
+    assert all(
+        call["metadata"]["preserve_status_message_id"] is True
+        for call in status.calls[-2:]
+    )
+    sleep.assert_awaited_once_with(2.0)
+    state = manager.current_state("Smoke test")
+    assert state is not None and state.platform_message_id == "15499"
 
 
 @pytest.mark.asyncio

@@ -340,3 +340,37 @@ async def test_normal_markdown_edit_does_not_require_task_card_validation(adapte
 
     assert result.success is True
     assert result.raw_response is None
+
+
+@pytest.mark.asyncio
+async def test_preserved_status_message_retries_same_id_without_fresh_send(adapter):
+    """A preserved binding survives a transient edit failure and later succeeds."""
+    adapter.edit_message.side_effect = [
+        SendResult(
+            success=False,
+            message_id="15499",
+            error="flood control",
+            retry_after=2.0,
+            error_kind="rate_limited",
+        ),
+        SendResult(success=True, message_id="15499"),
+    ]
+    metadata = {
+        "status_message_id": "15499",
+        "preserve_status_message_id": True,
+    }
+
+    failed = await adapter.send_or_update_status(
+        "-5141963563", "taskcard", "running", metadata=metadata,
+    )
+    succeeded = await adapter.send_or_update_status(
+        "-5141963563", "taskcard", "completed", metadata=metadata,
+    )
+
+    assert failed.success is False
+    assert failed.message_id == "15499"
+    assert failed.retry_after == 2.0
+    assert succeeded.success is True
+    assert [call.args[1] for call in adapter.edit_message.await_args_list] == ["15499", "15499"]
+    assert adapter._status_message_ids[("-5141963563", "taskcard")] == "15499"
+    adapter.send.assert_not_awaited()

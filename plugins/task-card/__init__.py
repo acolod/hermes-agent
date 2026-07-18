@@ -452,6 +452,7 @@ class TaskCardManager:
             "status": state.status,
             "terminal": state.terminal,
             "topic_identity": state.topic_identity,
+            "preserve_status_message_id": True,
             "validate_edit_response": True,
         }
         if state.platform_message_id:
@@ -534,7 +535,11 @@ class TaskCardManager:
                             self.store.save(current)
                 return
             if attempt < self.publish_retry_attempts:
-                await asyncio.sleep(self.publish_retry_seconds)
+                retry_after = getattr(result, "retry_after", None) if result is not None else None
+                delay = self.publish_retry_seconds
+                if isinstance(retry_after, (int, float)) and retry_after >= 0:
+                    delay = max(delay, float(retry_after))
+                await asyncio.sleep(delay)
 
         logger.warning(
             "task-card status publish exhausted %s attempts for %s",
