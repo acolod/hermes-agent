@@ -58,6 +58,17 @@ async def test_foreground_agent_run_emits_start_and_completed_lifecycle():
 
 
 @pytest.mark.asyncio
+async def test_foreground_terminal_activity_carries_observed_todo_snapshot():
+    todos = [{"id": "inspect", "content": "Inspect state", "status": "completed"}]
+    runner = _runner(result={"final_response": "done", "task_items": todos, "task_items_observed": True})
+
+    await runner._run_agent("do work", "", [], _source(), "session-1", session_key="telegram:chat-1:topic-9")
+
+    terminal = runner._emit_gateway_activity.call_args_list[-1].kwargs
+    assert terminal["task_items"] == todos
+
+
+@pytest.mark.asyncio
 async def test_foreground_agent_run_emits_failed_lifecycle_before_reraising():
     runner = _runner(error=RuntimeError("boom"))
     source = _source()
@@ -151,13 +162,17 @@ def test_gateway_activity_helper_emits_sanitized_context(monkeypatch):
     assert context.origin.chat_id == "chat-1"
     assert context.origin.thread_id == "topic-9"
     assert context.origin.session_key == "telegram:chat-1:topic-9"
-    assert call.kwargs["activity_snapshot"] == {
+    snapshot = call.kwargs["activity_snapshot"]
+    assert {key: snapshot[key] for key in ("kind", "phase", "status", "summary", "terminal")} == {
         "kind": "foreground",
         "phase": "foreground-start",
         "status": "running",
         "summary": "Started",
         "terminal": False,
     }
+    assert snapshot["activity_id"] == "foreground:telegram:chat-1:topic-9"
+    assert snapshot["revision"] == 1
+    assert snapshot["generation"]
     assert "gateway" not in call.kwargs
     assert "adapter" not in call.kwargs
 

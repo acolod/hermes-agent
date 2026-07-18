@@ -483,7 +483,7 @@ def reduce_task_card_state(
 
     items = event.items
     if items is None:
-        items = previous.items if previous is not None else ()
+        items = previous.items if previous is not None and same_generation else ()
     elif previous is not None and same_generation:
         items = _merge_task_items(previous.items, items)
 
@@ -1103,7 +1103,7 @@ class TaskCardManager:
                 return "Task card is not bound yet. Use /taskcard bind <label> in this conversation."
             if context.status is not None:
                 self._refresh_publish(state, context.status)
-                return ""
+                return "Task card refreshed — see the pinned card in this conversation."
             return render_task_card(state)
 
         if command in DEBUG_COMMANDS:
@@ -1291,6 +1291,10 @@ def _on_gateway_activity(
     )
 
 
+def _on_pre_llm_call(**_: Any) -> dict[str, str]:
+    return {"context": "For multi-step work or a requested checklist, use the todo tool to create and update the task list so the live task card stays current."}
+
+
 def register(ctx: Any) -> None:
     ctx.register_command(
         "taskcard",
@@ -1299,6 +1303,7 @@ def register(ctx: Any) -> None:
         args_hint="[show|bind <label>|refresh|debug|flush|reset|close]",
     )
     ctx.register_hook("gateway_activity", _on_gateway_activity)
+    ctx.register_hook("pre_llm_call", _on_pre_llm_call)
 
 
 __all__ = [

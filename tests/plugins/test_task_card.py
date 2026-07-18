@@ -107,7 +107,7 @@ def test_manifest_is_discoverable_and_registers_contextual_command_and_hook():
             registered["command"] = (name, handler, metadata)
 
         def register_hook(self, name, handler):
-            registered["hook"] = (name, handler)
+            registered.setdefault("hooks", []).append((name, handler))
 
     plugin.register(Context())
 
@@ -115,7 +115,7 @@ def test_manifest_is_discoverable_and_registers_contextual_command_and_hook():
     assert name == "taskcard"
     assert "context" in inspect.signature(handler).parameters
     assert metadata["args_hint"].startswith("[show|bind")
-    assert registered["hook"][0] == "gateway_activity"
+    assert {name for name, _ in registered["hooks"]} == {"gateway_activity", "pre_llm_call"}
 
 
 def test_public_renderer_is_a_concise_checklist_without_diagnostic_metadata(tmp_path):
@@ -411,7 +411,7 @@ async def test_default_command_refreshes_existing_card_without_posting_snapshot(
     await manager.wait_for_publishes()
 
     refreshed = manager.current_state("Improve task card")
-    assert response == ""
+    assert response == "Task card refreshed — see the pinned card in this conversation."
     assert refreshed is not None
     assert refreshed.revision == original.revision
     assert refreshed.platform_message_id == original_message_id
@@ -492,7 +492,7 @@ async def test_failed_refresh_does_not_advance_persisted_state(tmp_path):
     response = manager.handle_command("refresh", context)
     await manager.wait_for_publishes()
 
-    assert response == ""
+    assert response == "Task card refreshed — see the pinned card in this conversation."
     assert manager.current_state("Improve task card") == before
     assert manager.store.load("Improve task card", before.topic_identity) == before
 
@@ -614,6 +614,53 @@ async def test_second_foreground_turn_reopens_terminal_card_on_same_message(tmp_
     assert second_completed.platform_message_id == "15438"
     assert [call["revision"] for call in status.calls[-2:]] == [1, 2]
     assert all(call["metadata"]["status_message_id"] == "15438" for call in status.calls[-2:])
+
+
+@pytest.mark.asyncio
+async def test_new_foreground_generation_clears_prior_items_but_same_generation_omission_preserves_them(tmp_path):
+    plugin = _load_plugin()
+    status = _CaptureStatus()
+    manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0)
+    context = _context(status=status)
+    manager.handle_command("bind Current conversation", context)
+    await manager.wait_for_publishes()
+
+    seeded = manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "foreground", "generation": "old", "revision": 1,
+            "phase": "started", "status": "running", "task_items": [
+                {"id": "old", "label": "Prior task", "status": "completed"}
+            ],
+        },
+    )
+    terminal = manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={"kind": "foreground", "generation": "old", "revision": 2,
+                           "phase": "completed", "status": "completed", "terminal": True},
+    )
+    new_started = manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={"kind": "foreground", "generation": "new", "revision": 1,
+                           "phase": "foreground-start", "status": "running"},
+    )
+    same_generation = manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={"kind": "foreground", "generation": "new", "revision": 2,
+                           "phase": "working", "status": "running", "task_items": [
+                               {"id": "new", "label": "New task", "status": "in_progress"}
+                           ]},
+    )
+    terminal_same_generation = manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={"kind": "foreground", "generation": "new", "revision": 3,
+                           "phase": "completed", "status": "completed", "terminal": True},
+    )
+
+    assert seeded.items and terminal.items
+    assert new_started.items == ()
+    assert [item.item_id for item in same_generation.items] == ["new"]
+    assert [item.item_id for item in terminal_same_generation.items] == ["new"]
 
 
 @pytest.mark.asyncio

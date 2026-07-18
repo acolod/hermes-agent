@@ -25,6 +25,7 @@ except ModuleNotFoundError:
     pass
 
 import asyncio
+import uuid
 import concurrent.futures
 import dataclasses
 import inspect
@@ -13800,10 +13801,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     fallback_model=self._refresh_fallback_model(),
                 )
                 try:
-                    return agent.run_conversation(
+                    result = agent.run_conversation(
                         user_message=enriched_prompt,
                         task_id=task_id,
                     )
+                    if isinstance(result, dict):
+                        result = dict(result)
+                        items = getattr(agent, "_todo_store", None)
+                        items = items.read() if items is not None else []
+                        result["task_items"] = items
+                        result["task_items_observed"] = bool(items)
+                    return result
                 finally:
                     self._cleanup_agent_resources(agent)
 
@@ -13914,6 +13922,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 terminal=True,
                 task_id=task_id,
                 event_message_id=event_message_id,
+                task_items=(result.get("task_items") if isinstance(result, dict) and result.get("task_items_observed") else None),
             )
 
         except asyncio.CancelledError:
@@ -17476,6 +17485,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         terminal: bool,
         task_id: Optional[str] = None,
         event_message_id: Optional[str] = None,
+        task_items: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """Emit a bounded lifecycle observation to contextual plugins."""
         try:
@@ -17488,8 +17498,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "summary": str(summary)[:256],
                 "terminal": bool(terminal),
             }
+            lifecycle_key = f"{kind}:{task_id or session_key or source.chat_id}"
+            lifecycles = getattr(self, "_task_card_lifecycles", None)
+            if lifecycles is None:
+                lifecycles = {}
+                self._task_card_lifecycles = lifecycles
+            lifecycle = lifecycles.get(lifecycle_key)
+            if phase in {"foreground-start", "background-start"} or lifecycle is None:
+                lifecycle = {"generation": uuid.uuid4().hex, "revision": 0}
+                lifecycles[lifecycle_key] = lifecycle
+            lifecycle["revision"] += 1
+            snapshot["generation"] = lifecycle["generation"]
+            snapshot["revision"] = lifecycle["revision"]
+            snapshot["activity_id"] = lifecycle_key
             if task_id:
                 snapshot["task_id"] = str(task_id)[:128]
+            if task_items is not None:
+                snapshot["task_items"] = list(task_items)[:16]
             thread_metadata = self._thread_metadata_for_source(
                 source,
                 event_message_id,
@@ -17739,6 +17764,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ),
             terminal=True,
             event_message_id=event_message_id,
+            task_items=(
+                result.get("task_items")
+                if isinstance(result, dict) and result.get("task_items_observed")
+                else None
+            ),
         )
         return result
 
@@ -18745,6 +18775,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             for _t in (prev_tools or []):
                 if isinstance(_t, dict):
                     _names.append(_t.get("name") or "")
+                    if _t.get("name") == "todo":
+                        try:
+                            _raw = _t.get("result")
+                            if isinstance(_raw, str):
+                                try:
+                                    _parsed = json.loads(_raw)
+                                except json.JSONDecodeError:
+                                    _parsed, _ = json.JSONDecoder().raw_decode(_raw.lstrip())
+                            else:
+                                _parsed = _raw
+                            _todos = _parsed.get("todos") if isinstance(_parsed, dict) else None
+                            if isinstance(_todos, list):
+                                _loop_for_step.call_soon_threadsafe(
+                                    lambda: self._emit_gateway_activity(
+                                        source=source, session_key=session_key,
+                                        kind="foreground", phase="working", status="running",
+                                        summary="Foreground task checklist updated", terminal=False,
+                                        event_message_id=event_message_id, task_items=_todos,
+                                    )
+                                )
+                        except Exception:
+                            logger.debug("task-card todo update extraction failed", exc_info=True)
                 else:
                     _names.append(str(_t))
             safe_schedule_threadsafe(
@@ -20092,6 +20144,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception:
                     pass
 
+            _todo_items = []
+            _todo_observed = any(
+                isinstance(message, dict) and message.get("role") == "tool"
+                and "todo" in str(message.get("name") or "")
+                for message in (result_holder[0].get("messages", []) if result_holder[0] else [])
+            )
+            if _todo_observed:
+                _todo_store = getattr(agent, "_todo_store", None)
+                _todo_items = _todo_store.read() if _todo_store is not None else []
             return {
                 "final_response": final_response,
                 "last_reasoning": result.get("last_reasoning"),
@@ -20113,6 +20174,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "session_id": effective_session_id,
                 "response_previewed": result.get("response_previewed", False),
                 "response_transformed": result.get("response_transformed", False),
+                "task_items": _todo_items if _todo_observed else None,
+                "task_items_observed": _todo_observed,
                 # Pass through the agent_persisted flag so the persistence block
                 # above can correctly determine whether the codex app-server path
                 # self-persisted (it didn't — see codex_runtime.py).  Default

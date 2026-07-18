@@ -5,3 +5,4 @@ author: "Hermes Agent"
 kind: standalone
 provides_hooks:
   - gateway_activity
+  - pre_llm_call
