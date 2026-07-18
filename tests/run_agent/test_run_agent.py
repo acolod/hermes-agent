@@ -4252,6 +4252,41 @@ class TestRunConversation:
         assert mock_handle_function_call.call_args.kwargs["tool_call_id"] == "c1"
         assert mock_handle_function_call.call_args.kwargs["session_id"] == agent.session_id
 
+    def test_todo_observer_matches_step_callback_for_current_group_turn(self, agent):
+        self._setup_agent(agent)
+        agent.valid_tool_names.add("todo")
+        agent.tool_definitions = [
+            {"type": "function", "function": {"name": "todo", "description": "test", "parameters": {"type": "object"}}}
+        ]
+        todo = _mock_tool_call(name="todo", arguments='{"todos":[{"id":"current","content":"current","status":"pending"}]}', call_id="current-todo")
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response(content="", finish_reason="tool_calls", tool_calls=[todo]),
+            _mock_response(content="Done", finish_reason="stop"),
+        ]
+        observed, stepped = [], []
+        agent.step_callback = lambda _iteration, tools: stepped.append(tools)
+        history = [
+            {"role": "user", "content": "[prior]"},
+            {"role": "assistant", "tool_calls": [{"id": "old", "function": {"name": "todo", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "old", "content": '{"todos":[{"id":"old"}]}'},
+            {"role": "assistant", "content": "[repair]"},
+        ]
+        with (
+            patch("run_agent.handle_function_call", return_value='{"todos":[{"id":"current"}]}'),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                "[current group prompt]", conversation_history=history,
+                iteration_observer=lambda _messages, tools: observed.append(tools),
+            )
+        assert result["api_calls"] == 2
+        assert observed[-1] == stepped[-1]
+        assert observed[-1][0]["name"] == "todo"
+        assert '"id": "current"' in observed[-1][0]["result"]
+        assert '"id": "old"' not in observed[-1][0]["result"]
+
     def test_tool_call_none_args_verbose_logging_does_not_crash(self, agent):
         self._setup_agent(agent)
         agent.verbose_logging = True
