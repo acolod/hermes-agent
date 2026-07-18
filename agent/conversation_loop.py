@@ -706,10 +706,13 @@ def run_conversation(
         # Fire step_callback for gateway hooks (agent:step event)
         if agent.step_callback is not None:
             try:
-                prev_tools = _previous_tools_since_turn(
-                    messages,
-                    int(getattr(agent, "_task_card_turn_start_index", 0)),
-                )
+                prev_tools = getattr(agent, "_last_completed_tool_batch", None)
+                agent._last_completed_tool_batch = None
+                if prev_tools is None:
+                    prev_tools = _previous_tools_since_turn(
+                        messages,
+                        int(getattr(agent, "_task_card_turn_start_index", 0)),
+                    )
                 if iteration_observer is not None:
                     iteration_observer(messages, prev_tools)
                 agent.step_callback(api_call_count, prev_tools)
@@ -4880,6 +4883,19 @@ def run_conversation(
                         pass
 
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+                _results = {
+                    message.get("tool_call_id"): message.get("content", "")
+                    for message in messages
+                    if message.get("role") == "tool" and message.get("tool_call_id")
+                }
+                agent._last_completed_tool_batch = [
+                    {
+                        "name": call.function.name,
+                        "arguments": call.function.arguments,
+                        "result": _results.get(call.id),
+                    }
+                    for call in assistant_message.tool_calls
+                ]
 
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
