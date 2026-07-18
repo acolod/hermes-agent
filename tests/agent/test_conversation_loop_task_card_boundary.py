@@ -30,3 +30,19 @@ def test_previous_tools_since_turn_returns_only_current_turn_todo_batch():
     assert _previous_tools_since_turn(messages, turn_start=3) == [
         {"name": "todo", "arguments": "{}", "result": '{"todos":[{"id":"new"}]}'},
     ]
+
+
+def test_repaired_group_sequence_keeps_current_turn_todo_batch():
+    """Synthetic post-repair Telegram group shape; content is deliberately redacted."""
+    messages = [
+        {"role": "system", "content": "[repair marker]"},
+        {"role": "user", "content": "[prior turn]"},
+        {"role": "assistant", "content": "[prior answer]"},
+        {"role": "user", "content": "[current group prompt]"},
+        {"role": "assistant", "tool_calls": [_tool_call("group-todo")]},
+        {"role": "tool", "tool_call_id": "group-todo", "content": '{"todos":[{"id":"current"}]}'},
+    ]
+
+    assert _previous_tools_since_turn(messages, turn_start=3) == [
+        {"name": "todo", "arguments": "{}", "result": '{"todos":[{"id":"current"}]}'},
+    ]
