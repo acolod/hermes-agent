@@ -238,6 +238,651 @@ async def test_second_foreground_turn_reopens_terminal_card_on_same_message(tmp_
 
 
 @pytest.mark.asyncio
+async def test_external_gateway_activity_preserves_generation_revision_and_correlation(tmp_path):
+    plugin = _load_plugin()
+    status = _CaptureStatus()
+    manager = plugin.TaskCardManager(
+        plugin.TaskCardStore(tmp_path),
+        debounce_seconds=0,
+    )
+    context = _context(status=status)
+    manager.handle_command("bind Relay", context)
+    await manager.wait_for_publishes()
+
+    started = manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "relay",
+            "activity_id": "relay:task-123",
+            "generation": "relay-generation-1",
+            "revision": 1,
+            "phase": "started",
+            "status": "running",
+            "summary": "Relay started",
+            "terminal": False,
+        },
+    )
+    await manager.wait_for_publishes()
+    completed = manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "relay",
+            "activity_id": "relay:task-123",
+            "generation": "relay-generation-1",
+            "revision": 2,
+            "phase": "completed",
+            "status": "completed",
+            "summary": "Relay completed",
+            "terminal": True,
+        },
+    )
+    await manager.wait_for_publishes()
+
+    assert started is not None
+    assert started.generation == "relay-generation-1"
+    assert started.revision == 1
+    assert started.activity_id == "relay:task-123"
+    assert completed is not None
+    assert completed.generation == "relay-generation-1"
+    assert completed.revision == 2
+    assert completed.activity_id == "relay:task-123"
+    assert [call["revision"] for call in status.calls[-2:]] == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_external_gateway_activity_suppresses_stale_equal_and_unchanged_content(tmp_path):
+    plugin = _load_plugin()
+    status = _CaptureStatus()
+    manager = plugin.TaskCardManager(
+        plugin.TaskCardStore(tmp_path),
+        debounce_seconds=0,
+    )
+    context = _context(status=status)
+    manager.handle_command("bind Relay", context)
+    await manager.wait_for_publishes()
+    manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "relay",
+            "activity_id": "relay:task-123",
+            "generation": "relay-generation-1",
+            "revision": 1,
+            "phase": "started",
+            "status": "running",
+            "summary": "Relay started",
+            "terminal": False,
+        },
+    )
+    await manager.wait_for_publishes()
+    event = {
+        "kind": "relay",
+        "activity_id": "relay:task-123",
+        "generation": "relay-generation-1",
+        "revision": 2,
+        "phase": "working",
+        "status": "running",
+        "summary": "Relay working",
+        "terminal": False,
+    }
+    accepted = manager.on_gateway_activity(context=context, activity_snapshot=event)
+    await manager.wait_for_publishes()
+    calls_after_accepted = len(status.calls)
+
+    equal = manager.on_gateway_activity(context=context, activity_snapshot=event)
+    stale = manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={**event, "revision": 1, "summary": "stale"},
+    )
+    unchanged = manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={**event, "revision": 3},
+    )
+    await manager.wait_for_publishes()
+
+    persisted = manager.current_state("Relay", accepted.topic_identity)
+    assert persisted is not None and persisted.revision == 2
+    assert equal == persisted
+    assert stale == persisted
+    assert unchanged == persisted
+    assert len(status.calls) == calls_after_accepted
+
+
+@pytest.mark.asyncio
+async def test_external_gateway_activity_rejects_superseded_generation(tmp_path):
+    plugin = _load_plugin()
+    status = _CaptureStatus()
+    manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0)
+    context = _context(status=status)
+    manager.handle_command("bind Relay", context)
+    await manager.wait_for_publishes()
+
+    for event in (
+        {
+            "kind": "relay",
+            "activity_id": "relay:a",
+            "generation": "generation-a",
+            "revision": 1,
+            "phase": "started",
+            "status": "running",
+            "summary": "A started",
+            "terminal": False,
+        },
+        {
+            "kind": "relay",
+            "activity_id": "relay:a",
+            "generation": "generation-a",
+            "revision": 2,
+            "phase": "completed",
+            "status": "completed",
+            "summary": "A completed",
+            "terminal": True,
+        },
+        {
+            "kind": "relay",
+            "activity_id": "relay:b",
+            "generation": "generation-b",
+            "revision": 1,
+            "phase": "started",
+            "status": "running",
+            "summary": "B started",
+            "terminal": False,
+        },
+    ):
+        manager.on_gateway_activity(context=context, activity_snapshot=event)
+        await manager.wait_for_publishes()
+
+    calls_before_delayed = len(status.calls)
+    delayed = manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "relay",
+            "activity_id": "relay:a",
+            "generation": "generation-a",
+            "revision": 3,
+            "phase": "failed",
+            "status": "failed",
+            "summary": "delayed A failure",
+            "terminal": True,
+        },
+    )
+    await manager.wait_for_publishes()
+
+    current = manager.current_state("Relay")
+    assert delayed == current
+    assert current is not None and current.generation == "generation-b"
+    assert current.phase == "started"
+    assert len(status.calls) == calls_before_delayed
+
+
+@pytest.mark.asyncio
+async def test_status_ingress_publication_ack_tracks_actual_publish_result(tmp_path):
+    plugin = _load_plugin()
+    status = _CaptureStatus()
+    manager = plugin.TaskCardManager(
+        plugin.TaskCardStore(tmp_path),
+        debounce_seconds=0,
+        publish_retry_seconds=0,
+        publish_retry_attempts=1,
+    )
+    context = _context(status=status)
+    manager.handle_command("bind Relay", context)
+    await manager.wait_for_publishes()
+
+    success_ack = asyncio.get_running_loop().create_future()
+    context.metadata["_status_ingress_ack"] = success_ack
+    manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "relay",
+            "activity_id": "relay:ack-success",
+            "generation": "ack-success",
+            "revision": 1,
+            "phase": "started",
+            "status": "running",
+            "summary": "started",
+        },
+    )
+    await manager.wait_for_publishes()
+    assert success_ack.result() is True
+
+    manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "relay",
+            "activity_id": "relay:ack-success",
+            "generation": "ack-success",
+            "revision": 2,
+            "phase": "completed",
+            "status": "completed",
+            "summary": "completed",
+            "terminal": True,
+        },
+    )
+    await manager.wait_for_publishes()
+
+    failure_ack = asyncio.get_running_loop().create_future()
+    context.metadata["_status_ingress_ack"] = failure_ack
+    status.outcomes = [False]
+    manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "relay",
+            "activity_id": "relay:ack-failure",
+            "generation": "ack-failure",
+            "revision": 1,
+            "phase": "started",
+            "status": "running",
+            "summary": "will fail",
+        },
+    )
+    await manager.wait_for_publishes()
+    assert failure_ack.result() is False
+
+
+@pytest.mark.asyncio
+async def test_status_ingress_debounce_transfers_ack_to_coalesced_revision(tmp_path):
+    plugin = _load_plugin()
+    status = _CaptureStatus()
+    manager = plugin.TaskCardManager(
+        plugin.TaskCardStore(tmp_path),
+        debounce_seconds=0.02,
+        publish_retry_seconds=0,
+    )
+    context = _context(status=status)
+    manager.handle_command("bind Relay", context)
+    await manager.wait_for_publishes()
+    calls_before = len(status.calls)
+
+    first_ack = asyncio.get_running_loop().create_future()
+    context.metadata["_status_ingress_ack"] = first_ack
+    manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "relay",
+            "activity_id": "relay:coalesced",
+            "generation": "coalesced-generation",
+            "revision": 1,
+            "phase": "started",
+            "status": "running",
+            "summary": "started",
+        },
+    )
+
+    second_ack = asyncio.get_running_loop().create_future()
+    context.metadata["_status_ingress_ack"] = second_ack
+    manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "relay",
+            "activity_id": "relay:coalesced",
+            "generation": "coalesced-generation",
+            "revision": 2,
+            "phase": "working",
+            "status": "running",
+            "summary": "working",
+        },
+    )
+    await manager.wait_for_publishes()
+
+    assert first_ack.result() is True
+    assert second_ack.result() is True
+    assert len(status.calls) == calls_before + 1
+    assert manager.current_state("Relay").revision == 2
+
+
+@pytest.mark.asyncio
+async def test_duplicate_status_ingress_waits_for_pending_publish_failure(tmp_path):
+    plugin = _load_plugin()
+    status = _CaptureStatus()
+    manager = plugin.TaskCardManager(
+        plugin.TaskCardStore(tmp_path),
+        debounce_seconds=0.02,
+        publish_retry_seconds=0,
+        publish_retry_attempts=1,
+    )
+    context = _context(status=status)
+    manager.handle_command("bind Relay", context)
+    await manager.wait_for_publishes()
+    status.outcomes = [False]
+    event = {
+        "kind": "relay",
+        "activity_id": "relay:duplicate",
+        "generation": "duplicate-generation",
+        "revision": 1,
+        "phase": "started",
+        "status": "running",
+        "summary": "started",
+    }
+
+    first_ack = asyncio.get_running_loop().create_future()
+    context.metadata["_status_ingress_ack"] = first_ack
+    manager.on_gateway_activity(context=context, activity_snapshot=event)
+    duplicate_ack = asyncio.get_running_loop().create_future()
+    context.metadata["_status_ingress_ack"] = duplicate_ack
+    manager.on_gateway_activity(context=context, activity_snapshot=event)
+    assert not first_ack.done() and not duplicate_ack.done()
+
+    await manager.wait_for_publishes()
+
+    assert first_ack.result() is False
+    assert duplicate_ack.result() is False
+
+
+@pytest.mark.asyncio
+async def test_immediate_status_ingress_coalesces_without_stranding_ack(tmp_path):
+    plugin = _load_plugin()
+    status = _CaptureStatus()
+    manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0)
+    context = _context(status=status)
+    manager.handle_command("bind Relay", context)
+    await manager.wait_for_publishes()
+    calls_before = len(status.calls)
+
+    first_ack = asyncio.get_running_loop().create_future()
+    context.metadata["_status_ingress_ack"] = first_ack
+    manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "relay",
+            "activity_id": "relay:immediate",
+            "generation": "immediate-generation",
+            "revision": 1,
+            "phase": "started",
+            "status": "running",
+            "summary": "started",
+        },
+    )
+    second_ack = asyncio.get_running_loop().create_future()
+    context.metadata["_status_ingress_ack"] = second_ack
+    manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "relay",
+            "activity_id": "relay:immediate",
+            "generation": "immediate-generation",
+            "revision": 2,
+            "phase": "working",
+            "status": "running",
+            "summary": "working",
+        },
+    )
+    await manager.wait_for_publishes()
+
+    assert first_ack.result() is True
+    assert second_ack.result() is True
+    assert len(status.calls) == calls_before + 1
+    assert manager.current_state("Relay").revision == 2
+
+
+@pytest.mark.asyncio
+async def test_internal_lifecycle_state_survives_publish_failure(tmp_path):
+    plugin = _load_plugin()
+    status = _CaptureStatus()
+    manager = plugin.TaskCardManager(
+        plugin.TaskCardStore(tmp_path),
+        debounce_seconds=0,
+        publish_retry_seconds=0,
+        publish_retry_attempts=2,
+    )
+    context = _context(status=status)
+    manager.handle_command("bind Relay", context)
+    await manager.wait_for_publishes()
+
+    status.outcomes = [False, False]
+    manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "background",
+            "activity_id": "background:internal",
+            "generation": "internal-generation",
+            "phase": "background-start",
+            "status": "running",
+            "summary": "internal start",
+        },
+    )
+    await manager.wait_for_publishes()
+
+    failed_delivery_state = manager.current_state("Relay")
+    assert failed_delivery_state is not None
+    assert failed_delivery_state.generation == "internal-generation"
+    assert failed_delivery_state.phase == "background-start"
+
+    status.outcomes = [True]
+    manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "background",
+            "activity_id": "background:internal",
+            "generation": "internal-generation",
+            "phase": "completed",
+            "status": "completed",
+            "summary": "internal complete",
+        },
+        terminal=True,
+    )
+    await manager.wait_for_publishes()
+
+    completed = manager.current_state("Relay")
+    assert completed is not None
+    assert completed.phase == "completed"
+    assert completed.terminal is True
+
+
+@pytest.mark.asyncio
+async def test_newer_publish_failure_restores_inflight_success_baseline(tmp_path):
+    plugin = _load_plugin()
+
+    class BlockingStatus(_CaptureStatus):
+        def __init__(self):
+            super().__init__()
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def upsert_status(self, status_key, content, *, revision=None, metadata=None):
+            self.calls.append(
+                {
+                    "status_key": status_key,
+                    "content": content,
+                    "revision": revision,
+                    "metadata": metadata,
+                }
+            )
+            if metadata and metadata.get("generation") == "inflight-generation":
+                if revision == 1:
+                    self.started.set()
+                    await self.release.wait()
+                    return SimpleNamespace(success=True, message_id="message-inflight")
+                return SimpleNamespace(success=False, message_id=None)
+            return SimpleNamespace(success=True, message_id="message-bind")
+
+    status = BlockingStatus()
+    manager = plugin.TaskCardManager(
+        plugin.TaskCardStore(tmp_path),
+        debounce_seconds=0,
+        publish_retry_seconds=0,
+        publish_retry_attempts=1,
+    )
+    context = _context(status=status)
+    manager.handle_command("bind Relay", context)
+    await manager.wait_for_publishes()
+
+    first_ack = asyncio.get_running_loop().create_future()
+    context.metadata["_status_ingress_ack"] = first_ack
+    manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "relay",
+            "activity_id": "relay:inflight",
+            "generation": "inflight-generation",
+            "revision": 1,
+            "phase": "started",
+            "status": "running",
+            "summary": "started",
+        },
+    )
+    await status.started.wait()
+
+    second_ack = asyncio.get_running_loop().create_future()
+    context.metadata["_status_ingress_ack"] = second_ack
+    manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "relay",
+            "activity_id": "relay:inflight",
+            "generation": "inflight-generation",
+            "revision": 2,
+            "phase": "working",
+            "status": "running",
+            "summary": "working",
+        },
+    )
+    status.release.set()
+    await manager.wait_for_publishes()
+
+    current = manager.current_state("Relay")
+    assert current is not None
+    assert current.revision == 1
+    assert current.summary == "started"
+    assert current.platform_message_id == "message-inflight"
+    assert first_ack.result() is False
+    assert second_ack.result() is False
+
+
+@pytest.mark.asyncio
+async def test_rebind_cancels_pending_status_ingress_transaction(tmp_path):
+    plugin = _load_plugin()
+    status = _CaptureStatus()
+    manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0.05)
+    context = _context(status=status)
+    manager.handle_command("bind Relay", context)
+    await manager.wait_for_publishes()
+
+    pending_ack = asyncio.get_running_loop().create_future()
+    context.metadata["_status_ingress_ack"] = pending_ack
+    manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "relay",
+            "activity_id": "relay:pending-rebind",
+            "generation": "pending-rebind-generation",
+            "revision": 1,
+            "phase": "started",
+            "status": "running",
+            "summary": "pending",
+        },
+    )
+    context.metadata.pop("_status_ingress_ack")
+    manager.handle_command("bind Replacement", context)
+    await manager.wait_for_publishes()
+
+    assert pending_ack.result() is False
+    assert manager.current_state("Relay") is None
+    assert manager.current_state("Replacement") is not None
+
+
+@pytest.mark.asyncio
+async def test_reset_discards_pending_rollback_before_rebind_failure(tmp_path):
+    plugin = _load_plugin()
+    status = _CaptureStatus()
+    manager = plugin.TaskCardManager(
+        plugin.TaskCardStore(tmp_path),
+        debounce_seconds=0,
+        publish_retry_seconds=0,
+        publish_retry_attempts=1,
+    )
+    context = _context(status=status)
+    manager.handle_command("bind Relay", context)
+    await manager.wait_for_publishes()
+    old_state = manager.current_state("Relay")
+    assert old_state is not None
+
+    manager.debounce_seconds = 30
+    pending_ack = asyncio.get_running_loop().create_future()
+    context.metadata["_status_ingress_ack"] = pending_ack
+    manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "relay",
+            "activity_id": "relay:pending",
+            "generation": "pending-generation",
+            "revision": 1,
+            "phase": "started",
+            "status": "running",
+            "summary": "pending",
+        },
+    )
+    context.metadata.pop("_status_ingress_ack")
+    manager.handle_command("reset Relay", context)
+    assert pending_ack.result() is False
+    assert manager.store.load("Relay") is None
+
+    manager.debounce_seconds = 0
+    status.outcomes = [False]
+    manager.handle_command("bind Relay", context)
+    await manager.wait_for_publishes()
+    rebound = manager.current_state("Relay")
+    assert rebound is not None
+    assert rebound != old_state
+    assert rebound.phase == "command"
+
+
+@pytest.mark.asyncio
+async def test_failed_external_edit_rolls_back_and_same_revision_can_retry_without_replacement(tmp_path):
+    plugin = _load_plugin()
+    status = _CaptureStatus()
+    manager = plugin.TaskCardManager(
+        plugin.TaskCardStore(tmp_path),
+        debounce_seconds=0,
+        publish_retry_seconds=0,
+        publish_retry_attempts=2,
+    )
+    context = _context(status=status)
+    manager.handle_command("bind Relay", context)
+    await manager.wait_for_publishes()
+    baseline = manager.current_state("Relay")
+    assert baseline is not None and baseline.platform_message_id == "message-1"
+
+    event = {
+        "kind": "relay",
+        "activity_id": "relay:task-failure",
+        "generation": "relay-generation-failure",
+        "revision": 1,
+        "phase": "started",
+        "status": "running",
+        "summary": "Relay working",
+        "terminal": False,
+    }
+    status.outcomes = [False, False]
+    failed_ack = asyncio.get_running_loop().create_future()
+    context.metadata["_status_ingress_ack"] = failed_ack
+    manager.on_gateway_activity(context=context, activity_snapshot=event)
+    await manager.wait_for_publishes()
+
+    assert manager.current_state("Relay") == baseline
+    assert failed_ack.result() is False
+    assert manager.store.load("Relay") == baseline
+    assert [call["metadata"]["status_message_id"] for call in status.calls[-2:]] == [
+        "message-1",
+        "message-1",
+    ]
+
+    status.outcomes = [True]
+    retry_ack = asyncio.get_running_loop().create_future()
+    context.metadata["_status_ingress_ack"] = retry_ack
+    retried = manager.on_gateway_activity(context=context, activity_snapshot=event)
+    await manager.wait_for_publishes()
+    persisted = manager.current_state("Relay")
+
+    assert retried is not None and retried.revision == 1
+    assert persisted is not None
+    assert persisted.generation == "relay-generation-failure"
+    assert persisted.revision == 1
+    assert persisted.platform_message_id == "message-4"
+    assert status.calls[-1]["metadata"]["status_message_id"] == "message-1"
+    assert retry_ack.result() is True
+
+
+@pytest.mark.asyncio
 async def test_publish_retries_failure_and_persists_platform_message_binding(tmp_path):
     plugin = _load_plugin()
     status = _CaptureStatus([False, True])

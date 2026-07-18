@@ -29,12 +29,13 @@ TERMINAL_PHASES = {
     "failed",
     "ready_for_alex",
 }
-START_PHASES = {"background-start", "foreground-start"}
+START_PHASES = {"background-start", "foreground-start", "started"}
 PHASE_RANK = {
     "queued": 0,
     "command": 1,
     "background-start": 2,
     "foreground-start": 2,
+    "started": 2,
     "running": 3,
     "working": 3,
     "phase": 4,
@@ -118,6 +119,7 @@ class TaskCardState:
     updated_at: str = ""
     activity_snapshot: dict[str, Any] | None = None
     metadata: dict[str, Any] | None = None
+    retired_generations: list[str] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return _clean(asdict(self))
@@ -155,6 +157,11 @@ class TaskCardState:
             updated_at=str(payload.get("updated_at") or ""),
             activity_snapshot=dict(payload.get("activity_snapshot") or {}),
             metadata=dict(payload.get("metadata") or {}),
+            retired_generations=[
+                str(item)
+                for item in list(payload.get("retired_generations") or [])[-16:]
+                if str(item).strip()
+            ],
         )
 
 
@@ -177,9 +184,29 @@ class TaskCardEvent:
     summary: str
     activity_snapshot: dict[str, Any]
     metadata: dict[str, Any]
+    source_revision: int | None = None
 
     def revision_hash(self) -> str:
-        return _stable_hash(_clean(asdict(self)))
+        # Revision/generation transport fields and non-rendered metadata must not
+        # turn unchanged visible content into a new card revision.
+        return _stable_hash(
+            {
+                "binding": self.binding,
+                "topic_identity": self.topic_identity,
+                "activity_kind": self.activity_kind,
+                "activity_id": self.activity_id,
+                "command": self.command,
+                "phase": self.phase,
+                "status": self.status,
+                "terminal": self.terminal,
+                "surface": self.surface,
+                "platform": self.platform,
+                "chat_id": self.chat_id,
+                "thread_id": self.thread_id,
+                "session_key": self.session_key,
+                "summary": self.summary,
+            }
+        )
 
 
 def render_task_card(state: TaskCardState) -> str:
@@ -213,10 +240,16 @@ def reduce_task_card_state(
     event: TaskCardEvent,
 ) -> TaskCardState:
     event_hash = event.revision_hash()
+    retired_generations: list[str] = []
     if previous is not None:
+        retired_generations = list(previous.retired_generations or [])[-16:]
+        if event.generation in retired_generations:
+            return previous
         same_generation = previous.generation == event.generation
         if same_generation:
             if previous.terminal or previous.revision_hash == event_hash:
+                return previous
+            if event.source_revision is not None and event.source_revision <= previous.revision:
                 return previous
             if (
                 previous.activity_id
@@ -226,11 +259,26 @@ def reduce_task_card_state(
                 return previous
             if _phase_rank(event.phase) < _phase_rank(previous.phase) and not event.terminal:
                 return previous
-            revision = previous.revision + 1
+            revision = event.source_revision or (previous.revision + 1)
         else:
-            revision = 1
+            if event.source_revision is not None and (
+                event.source_revision != 1 or event.phase not in START_PHASES
+            ):
+                return previous
+            if (
+                event.source_revision is not None
+                and not previous.terminal
+                and previous.phase != "command"
+            ):
+                return previous
+            if previous.generation:
+                retired_generations = [
+                    *[item for item in retired_generations if item != previous.generation],
+                    previous.generation,
+                ][-16:]
+            revision = event.source_revision or 1
     else:
-        revision = 1
+        revision = event.source_revision or 1
 
     state = TaskCardState(
         binding=event.binding,
@@ -256,7 +304,8 @@ def reduce_task_card_state(
         summary=event.summary,
         updated_at=now_iso(),
         activity_snapshot=event.activity_snapshot,
-        metadata=event.metadata,
+        metadata={**dict(previous.metadata or {}), **event.metadata} if previous else event.metadata,
+        retired_generations=retired_generations,
     )
     return _with_content_hash(state)
 
@@ -333,6 +382,13 @@ class TaskCardStore:
             )
         return state
 
+    def delete_card(self, topic_identity: str, binding: str) -> None:
+        with self._lock:
+            try:
+                self.path_for_card(topic_identity, binding).unlink()
+            except FileNotFoundError:
+                pass
+
     def _load_binding(self, topic_identity: str) -> str | None:
         try:
             payload = json.loads(
@@ -406,6 +462,10 @@ class TaskCardManager:
         self._publishers: dict[tuple[str, str], Any] = {}
         self._pending_handles: dict[tuple[str, str], asyncio.TimerHandle] = {}
         self._publish_tasks: set[asyncio.Task[Any]] = set()
+        self._publish_tasks_by_key: dict[tuple[str, str], set[asyncio.Task[Any]]] = {}
+        self._publish_locks: dict[tuple[str, str], asyncio.Lock] = {}
+        self._rollback_states: dict[tuple[str, str], TaskCardState | None] = {}
+        self._publication_acks: dict[tuple[str, str, str, int], list[Any]] = {}
         self._lock = threading.RLock()
 
     def current_state(
@@ -438,11 +498,60 @@ class TaskCardManager:
         if handle is not None:
             handle.cancel()
 
-    async def _publish(self, key: tuple[str, str], publisher: Any) -> None:
-        topic_identity, binding = key
-        state = self.current_state(binding, topic_identity)
-        if state is None:
+    def _cancel_transaction(self, key: tuple[str, str]) -> None:
+        self._cancel_pending(key)
+        for task in list(self._publish_tasks_by_key.pop(key, set())):
+            task.cancel()
+        self._rollback_states.pop(key, None)
+        for ack_key in [item for item in self._publication_acks if item[:2] == key]:
+            for ack in self._publication_acks.pop(ack_key, []):
+                if not ack.done():
+                    ack.set_result(False)
+
+    @staticmethod
+    def _publication_key(state: TaskCardState) -> tuple[str, str, str, int]:
+        return (state.topic_identity, state.binding, state.generation, state.revision)
+
+    def _register_publication_ack(self, state: TaskCardState, ack: Any) -> None:
+        if ack is None or getattr(ack, "done", lambda: True)():
             return
+        self._publication_acks.setdefault(self._publication_key(state), []).append(ack)
+
+    def _resolve_publication_acks(self, state: TaskCardState, success: bool) -> None:
+        for ack in self._publication_acks.pop(self._publication_key(state), []):
+            if not getattr(ack, "done", lambda: True)():
+                ack.set_result(bool(success))
+
+    def _transfer_pending_publication_acks(
+        self,
+        key: tuple[str, str],
+        state: TaskCardState,
+    ) -> None:
+        destination = self._publication_key(state)
+        transferred: list[Any] = []
+        for publication_key in list(self._publication_acks):
+            if publication_key[:2] == key and publication_key != destination:
+                transferred.extend(self._publication_acks.pop(publication_key, []))
+        if transferred:
+            self._publication_acks.setdefault(destination, []).extend(transferred)
+
+    async def _publish(
+        self,
+        key: tuple[str, str],
+        publisher: Any,
+        state: TaskCardState,
+    ) -> None:
+        lock = self._publish_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            await self._publish_state(key, publisher, state)
+
+    async def _publish_state(
+        self,
+        key: tuple[str, str],
+        publisher: Any,
+        state: TaskCardState,
+    ) -> None:
+        topic_identity, binding = key
         metadata = {
             "binding": state.binding,
             "generation": state.generation,
@@ -476,6 +585,7 @@ class TaskCardManager:
                 or current.generation != state.generation
                 or current.revision != state.revision
             ):
+                self._resolve_publication_acks(state, False)
                 return
             try:
                 result = publisher.upsert_status(
@@ -519,20 +629,29 @@ class TaskCardManager:
 
             if success:
                 message_id = getattr(result, "message_id", None) if result is not None else None
-                if message_id:
-                    with self._lock:
-                        current = self.current_state(binding, topic_identity)
-                        if (
-                            current is not None
-                            and current.generation == state.generation
-                            and current.revision == state.revision
-                        ):
+                with self._lock:
+                    current = self.current_state(binding, topic_identity)
+                    if (
+                        current is not None
+                        and current.generation == state.generation
+                        and current.revision == state.revision
+                    ):
+                        if message_id:
                             current = replace(
                                 current,
                                 platform_message_id=str(message_id),
                             )
-                            self._state_cache[key] = current
-                            self.store.save(current)
+                        self._state_cache[key] = current
+                        self.store.save(current)
+                        self._rollback_states.pop(key, None)
+                        self._resolve_publication_acks(state, True)
+                    else:
+                        delivered = (
+                            replace(state, platform_message_id=str(message_id))
+                            if message_id
+                            else state
+                        )
+                        self._rollback_states[key] = delivered
                 return
             if attempt < self.publish_retry_attempts:
                 retry_after = getattr(result, "retry_after", None) if result is not None else None
@@ -546,54 +665,111 @@ class TaskCardManager:
             self.publish_retry_attempts,
             binding,
         )
+        with self._lock:
+            current = self.current_state(binding, topic_identity)
+            if (
+                current is not None
+                and current.generation == state.generation
+                and current.revision == state.revision
+                and key in self._rollback_states
+            ):
+                previous = self._rollback_states.pop(key)
+                if previous is None:
+                    self._state_cache.pop(key, None)
+                    self.store.delete_card(topic_identity, binding)
+                else:
+                    self._state_cache[key] = previous
+                    self.store.save(previous)
+        self._resolve_publication_acks(state, False)
 
-    def _spawn_publish(self, key: tuple[str, str], publisher: Any) -> None:
-        task = asyncio.get_running_loop().create_task(self._publish(key, publisher))
+    def _spawn_publish(self, state: TaskCardState, publisher: Any) -> None:
+        key = (state.topic_identity, state.binding)
+        task = asyncio.get_running_loop().create_task(self._publish(key, publisher, state))
         self._publish_tasks.add(task)
-        task.add_done_callback(self._publish_tasks.discard)
+        self._publish_tasks_by_key.setdefault(key, set()).add(task)
 
-    def _schedule_publish(self, state: TaskCardState, publisher: Any) -> None:
+        def discard(completed: asyncio.Task[Any]) -> None:
+            self._publish_tasks.discard(completed)
+            tasks = self._publish_tasks_by_key.get(key)
+            if tasks is not None:
+                tasks.discard(completed)
+                if not tasks:
+                    self._publish_tasks_by_key.pop(key, None)
+
+        task.add_done_callback(discard)
+
+    def _schedule_publish(self, state: TaskCardState, publisher: Any) -> bool:
         key = (state.topic_identity, state.binding)
         self._cancel_pending(key)
         if publisher is None:
-            return
+            return False
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            return
+            return False
         if state.terminal or self.debounce_seconds == 0:
-            self._spawn_publish(key, publisher)
-            return
+            self._spawn_publish(state, publisher)
+            return True
 
         def enqueue() -> None:
             self._pending_handles.pop(key, None)
-            self._spawn_publish(key, publisher)
+            self._spawn_publish(state, publisher)
 
         self._pending_handles[key] = loop.call_later(
             self.debounce_seconds,
             enqueue,
         )
+        return True
 
     async def wait_for_publishes(self) -> None:
         while any(not handle.cancelled() for handle in self._pending_handles.values()):
             await asyncio.sleep(self.debounce_seconds + 0.01)
         while self._publish_tasks:
-            await asyncio.gather(*list(self._publish_tasks))
+            await asyncio.gather(*list(self._publish_tasks), return_exceptions=True)
 
-    def _record(self, event: TaskCardEvent, publisher: Any) -> TaskCardState:
+    def _record(
+        self,
+        event: TaskCardEvent,
+        publisher: Any,
+        *,
+        publication_ack: Any = None,
+    ) -> TaskCardState:
         with self._lock:
             key = (event.topic_identity, event.binding)
             previous = self.current_state(event.binding, event.topic_identity)
             next_state = reduce_task_card_state(previous, event)
-            if next_state is not previous:
+            changed = next_state is not previous
+            if not changed:
+                if publication_ack is not None and not publication_ack.done():
+                    if key in self._rollback_states:
+                        self._register_publication_ack(next_state, publication_ack)
+                    else:
+                        publication_ack.set_result(True)
+                return next_state
+            if changed:
                 self._state_cache[key] = next_state
-                self.store.save(next_state)
             if publisher is not None:
                 self._publishers[key] = publisher
-            self._schedule_publish(
-                next_state,
-                publisher or self._publishers.get(key),
-            )
+            if changed:
+                if publication_ack is None and key in self._rollback_states:
+                    self._cancel_transaction(key)
+                coalescing_transaction = (
+                    publication_ack is not None and key in self._rollback_states
+                )
+                scheduled = self._schedule_publish(
+                    next_state,
+                    publisher or self._publishers.get(key),
+                )
+                if scheduled:
+                    if publication_ack is not None:
+                        if coalescing_transaction:
+                            self._transfer_pending_publication_acks(key, next_state)
+                        self._rollback_states.setdefault(key, previous)
+                        self._register_publication_ack(next_state, publication_ack)
+                else:
+                    self.store.save(next_state)
+                    if publication_ack is not None and not publication_ack.done():
+                        publication_ack.set_result(False)
             return next_state
 
     def _event(
@@ -607,6 +783,7 @@ class TaskCardManager:
         activity_snapshot: dict[str, Any] | None = None,
         terminal: bool = False,
         generation: str | None = None,
+        source_revision: int | None = None,
         activity_kind: str | None = None,
         activity_id: str | None = None,
     ) -> TaskCardEvent:
@@ -642,7 +819,14 @@ class TaskCardManager:
             session_key=context.origin.session_key,
             summary=str(summary)[:MAX_SUMMARY_LENGTH],
             activity_snapshot=_clean(activity_snapshot or {}),
-            metadata=_clean(dict(context.metadata or {})),
+            metadata=_clean(
+                {
+                    key: value
+                    for key, value in dict(context.metadata or {}).items()
+                    if not str(key).startswith("_")
+                }
+            ),
+            source_revision=source_revision,
         )
 
     def handle_command(self, raw_args: str, context: PluginCommandContext) -> str:
@@ -668,7 +852,7 @@ class TaskCardManager:
             previous_binding = self.store.resolve_binding(topic_identity)
             if previous_binding is not None:
                 previous_key = (topic_identity, previous_binding)
-                self._cancel_pending(previous_key)
+                self._cancel_transaction(previous_key)
                 self.store.clear(previous_binding, topic_identity)
                 self._state_cache.pop(previous_key, None)
                 self._publishers.pop(previous_key, None)
@@ -692,7 +876,7 @@ class TaskCardManager:
         key = (topic_identity, binding)
 
         if command == "reset":
-            self._cancel_pending(key)
+            self._cancel_transaction(key)
             self.store.clear(binding, topic_identity)
             self._state_cache.pop(key, None)
             self._publishers.pop(key, None)
@@ -704,7 +888,7 @@ class TaskCardManager:
                 return "Task card has no state to flush yet."
             publisher = context.status or self._publishers.get(key)
             if publisher is not None:
-                self._spawn_publish(key, publisher)
+                self._spawn_publish(state, publisher)
                 return f"Task card flush queued: {binding}"
             return render_task_card(state)
 
@@ -736,7 +920,7 @@ class TaskCardManager:
         activity = dict(activity_snapshot or {})
         activity_kind = str(activity.get("kind") or "foreground")
         task_id = str(activity.get("task_id") or "")
-        activity_id = (
+        activity_id = str(activity.get("activity_id") or "") or (
             f"{activity_kind}:{task_id}"
             if task_id
             else activity_kind
@@ -750,7 +934,14 @@ class TaskCardManager:
         )
         is_terminal = is_terminal or phase in TERMINAL_PHASES
         previous = self.current_state(binding, topic_identity)
-        generation = (
+        external_generation = str(activity.get("generation") or "").strip() or None
+        external_revision = activity.get("revision")
+        source_revision = (
+            external_revision
+            if isinstance(external_revision, int) and not isinstance(external_revision, bool) and external_revision > 0
+            else None
+        )
+        generation = external_generation or (
             uuid.uuid4().hex
             if phase in START_PHASES and previous is not None and previous.terminal
             else None
@@ -776,10 +967,15 @@ class TaskCardManager:
             activity_snapshot=activity,
             terminal=is_terminal,
             generation=generation,
+            source_revision=source_revision,
             activity_kind=activity_kind,
             activity_id=activity_id,
         )
-        return self._record(event, context.status)
+        return self._record(
+            event,
+            context.status,
+            publication_ack=context.metadata.get("_status_ingress_ack"),
+        )
 
 
 _MANAGERS: dict[str, TaskCardManager] = {}

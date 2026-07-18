@@ -2937,6 +2937,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self.delivery_router = DeliveryRouter(self.config)
         self._running = False
         self._gateway_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._status_ingress = None
         self._shutdown_event = asyncio.Event()
         self._exit_cleanly = False
         self._exit_with_failure = False
@@ -7403,6 +7404,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return True
         self.delivery_router.adapters = self.adapters
         self._wire_teams_pipeline_runtime()
+        await self._start_status_ingress()
 
         self._running = True
         self._update_runtime_status("running")
@@ -8278,6 +8280,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             self._running = False
             self._draining = True
+            await GatewayRunner._stop_status_ingress(self)
 
             # Notify all chats with active agents BEFORE draining.
             # Adapters are still connected here, so messages can be sent.
@@ -17491,6 +17494,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 source,
                 event_message_id,
             )
+            status_origin_handle = None
+            ingress = getattr(self, "_status_ingress", None)
+            if ingress is not None:
+                from gateway.status_ingress import OriginRoute
+
+                platform_value = getattr(source.platform, "value", source.platform)
+                status_origin_handle = ingress.register_origin(
+                    OriginRoute(
+                        platform=str(platform_value),
+                        chat_id=str(source.chat_id),
+                        thread_id=(str(source.thread_id) if source.thread_id is not None else None),
+                        session_key=(str(session_key) if session_key is not None else None),
+                        profile=(str(source.profile) if source.profile is not None else None),
+                        chat_type=(str(source.chat_type) if source.chat_type is not None else None),
+                        status_metadata=dict(thread_metadata or {}),
+                    )
+                )
             context = build_plugin_command_context(
                 command="gateway_activity",
                 raw_args="",
@@ -17502,6 +17522,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 metadata={
                     "surface": "gateway_activity",
                     "kind": snapshot["kind"],
+                    **(
+                        {"status_origin_handle": status_origin_handle}
+                        if status_origin_handle is not None
+                        else {}
+                    ),
                     **({"task_id": snapshot["task_id"]} if "task_id" in snapshot else {}),
                 },
             )
@@ -17513,6 +17538,102 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except Exception as exc:
             logger.warning("gateway_activity hook invocation failed: %s", exc)
+
+    async def _start_status_ingress(self) -> None:
+        """Start the single local status ingress on the gateway-owned loop."""
+        if sys.platform == "win32":
+            logger.info("Local status ingress disabled: Unix sockets are unavailable on Windows")
+            return
+        ingress = getattr(self, "_status_ingress", None)
+        try:
+            if ingress is None:
+                from gateway.status_ingress import GatewayStatusIngress
+
+                ingress = GatewayStatusIngress(
+                    get_hermes_home() / "gateway" / "status-ingress",
+                    on_event=self._handle_status_ingress_event,
+                )
+                self._status_ingress = ingress
+            await ingress.start()
+        except Exception as exc:
+            logger.warning("Local status ingress unavailable; continuing without it: %s", exc)
+            if ingress is not None:
+                try:
+                    await ingress.stop()
+                except Exception:
+                    logger.debug("Local status ingress cleanup failed", exc_info=True)
+            self._status_ingress = None
+
+    async def _stop_status_ingress(self) -> None:
+        ingress = getattr(self, "_status_ingress", None)
+        if ingress is not None:
+            await ingress.stop()
+
+    async def _handle_status_ingress_event(self, route, event: Dict[str, Any]) -> Dict[str, Any]:
+        """Resolve one authenticated external event into the existing plugin path."""
+        from gateway.status_ingress import event_is_terminal
+        from hermes_cli.plugins import build_plugin_command_context, invoke_hook
+
+        source = SessionSource(
+            platform=Platform(route.platform),
+            chat_id=route.chat_id,
+            chat_type=route.chat_type or "dm",
+            thread_id=route.thread_id,
+            profile=route.profile,
+        )
+        terminal = event_is_terminal(event)
+        publication_ack = asyncio.get_running_loop().create_future()
+        snapshot: Dict[str, Any] = {
+            "kind": event["activity_kind"],
+            "activity_id": event["activity_id"],
+            "generation": event["generation"],
+            "revision": event["revision"],
+            "phase": event["phase"],
+            "status": event["status"],
+            "summary": event["summary"],
+            "terminal": terminal,
+            "metadata": dict(event.get("metadata") or {}),
+        }
+        context = build_plugin_command_context(
+            command="gateway_activity",
+            raw_args="",
+            source=source,
+            session_key=route.session_key,
+            adapter=self._adapter_for_source(source),
+            thread_id=route.thread_id,
+            status_metadata=dict(route.status_metadata or {}),
+            metadata={
+                "surface": "status_ingress",
+                "kind": event["activity_kind"],
+                "external_metadata": dict(event.get("metadata") or {}),
+                "_status_ingress_ack": publication_ack,
+            },
+        )
+        hook_results = invoke_hook(
+            "gateway_activity",
+            context=context,
+            activity_snapshot=snapshot,
+            terminal=terminal,
+        )
+        if not hook_results:
+            publication_ack.cancel()
+            raise RuntimeError("status ingress event was not accepted by a plugin")
+        try:
+            published = await asyncio.wait_for(
+                asyncio.shield(publication_ack),
+                timeout=30.0,
+            )
+        except asyncio.TimeoutError as exc:
+            publication_ack.cancel()
+            raise RuntimeError("status ingress publication timed out") from exc
+        if not published:
+            raise RuntimeError("status ingress publication failed")
+        return {
+            "accepted": True,
+            "activity_id": event["activity_id"],
+            "generation": event["generation"],
+            "revision": event["revision"],
+        }
 
     async def _run_agent(
         self,
