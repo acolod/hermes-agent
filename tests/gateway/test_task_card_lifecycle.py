@@ -58,6 +58,19 @@ async def test_foreground_agent_run_emits_start_and_completed_lifecycle():
 
 
 @pytest.mark.asyncio
+async def test_foreground_lifecycle_uses_one_unique_task_id_for_start_and_terminal():
+    runner = _runner()
+
+    await runner._run_agent("do work", "", [], _source(), "session-1", session_key="telegram:chat-1:topic-9")
+
+    started, terminal = runner._emit_gateway_activity.call_args_list
+    task_id = started.kwargs["task_id"]
+    assert task_id.startswith("fg_")
+    assert terminal.kwargs["task_id"] == task_id
+    assert runner._run_agent_inner.await_args.kwargs["task_card_task_id"] == task_id
+
+
+@pytest.mark.asyncio
 async def test_foreground_terminal_activity_carries_observed_todo_snapshot():
     todos = [{"id": "inspect", "content": "Inspect state", "status": "completed"}]
     runner = _runner(result={"final_response": "done", "task_items": todos, "task_items_observed": True})

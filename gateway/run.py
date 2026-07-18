@@ -17685,6 +17685,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         multiplexing is off this is a transparent pass-through — zero behavior
         change for single-profile gateways.
         """
+        task_card_task_id = f"fg_{uuid.uuid4().hex}"
         self._emit_gateway_activity(
             source=source,
             session_key=session_key,
@@ -17693,6 +17694,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             status="running",
             summary="Foreground task started",
             terminal=False,
+            task_id=task_card_task_id,
             event_message_id=event_message_id,
         )
         try:
@@ -17700,6 +17702,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 result = await self._run_agent_inner(
                     message, context_prompt, history, source, session_id,
                     session_key=session_key, run_generation=run_generation,
+                    task_card_task_id=task_card_task_id,
                     _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
                     channel_prompt=channel_prompt, moa_config=moa_config,
                     persist_user_message=persist_user_message,
@@ -17711,6 +17714,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     result = await self._run_agent_inner(
                         message, context_prompt, history, source, session_id,
                         session_key=session_key, run_generation=run_generation,
+                        task_card_task_id=task_card_task_id,
                         _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
                         channel_prompt=channel_prompt, moa_config=moa_config,
                         persist_user_message=persist_user_message,
@@ -17725,6 +17729,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 status="cancelled",
                 summary="Foreground task cancelled",
                 terminal=True,
+                task_id=task_card_task_id,
                 event_message_id=event_message_id,
             )
             raise
@@ -17737,6 +17742,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 status="failed",
                 summary="Foreground task failed",
                 terminal=True,
+                task_id=task_card_task_id,
                 event_message_id=event_message_id,
             )
             raise
@@ -17763,6 +17769,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else ("Foreground task failed" if failed else "Foreground task completed")
             ),
             terminal=True,
+            task_id=task_card_task_id,
             event_message_id=event_message_id,
             task_items=(
                 result.get("task_items")
@@ -17885,6 +17892,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_id: str,
         session_key: str = None,
         run_generation: Optional[int] = None,
+        task_card_task_id: Optional[str] = None,
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
@@ -18792,6 +18800,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         source=source, session_key=session_key,
                                         kind="foreground", phase="working", status="running",
                                         summary="Foreground task checklist updated", terminal=False,
+                                        task_id=task_card_task_id,
                                         event_message_id=event_message_id, task_items=_todos,
                                     )
                                 )
@@ -19339,7 +19348,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             agent.tool_start_callback = (
                 voice_ack_callback if _voice_ack_guild[0] is not None else None
             )
-            agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
+            agent.step_callback = _step_callback_sync
             agent.stream_delta_callback = _stream_delta_cb
             agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
             agent.status_callback = _status_callback_sync

@@ -805,8 +805,13 @@ class TaskCardManager:
                 self._resolve_publication_acks(state, False)
                 return
             try:
+                status_key = (
+                    f"taskcard:{state.binding}"
+                    if state.binding.startswith("foreground:")
+                    else "taskcard"
+                )
                 result = publisher.upsert_status(
-                    "taskcard",
+                    status_key,
                     render_task_card(state),
                     revision=(
                         state.revision
@@ -1183,13 +1188,17 @@ class TaskCardManager:
         activity_snapshot: dict[str, Any] | None = None,
         terminal: bool | None = None,
     ) -> TaskCardState | None:
-        topic_identity = _topic_identity(context)
-        binding = self.store.resolve_binding(topic_identity)
-        if binding is None:
-            return None
         activity = dict(activity_snapshot or {})
         activity_kind = str(activity.get("kind") or "foreground")
         task_id = str(activity.get("task_id") or "")
+        topic_identity = _topic_identity(context)
+        binding = self.store.resolve_binding(topic_identity)
+        if activity_kind == "foreground" and task_id:
+            if "task_items" not in activity:
+                return None
+            binding = f"foreground:{task_id}"
+        if binding is None:
+            return None
         activity_id = str(activity.get("activity_id") or "") or (
             f"{activity_kind}:{task_id}"
             if task_id

@@ -341,6 +341,42 @@ def test_single_row_fallback_is_preserved_without_structured_items(tmp_path):
     assert plugin.render_task_card(state).endswith("- 🔄 No structured plan available")
 
 
+def test_foreground_todo_creates_task_keyed_card_without_conversation_binding(tmp_path):
+    plugin = _load_plugin()
+    manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0)
+    context = _context(status=_CaptureStatus())
+
+    state = manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "foreground", "task_id": "fg_alpha", "activity_id": "foreground:fg_alpha",
+            "generation": "gen-alpha", "revision": 2, "phase": "working", "status": "running",
+            "task_items": [{"id": "one", "content": "First step", "status": "in_progress"}],
+        },
+    )
+
+    assert state is not None
+    assert state.binding == "foreground:fg_alpha"
+    assert manager.store.resolve_binding(state.topic_identity) is None
+    assert manager.current_state("foreground:fg_alpha", state.topic_identity) == state
+
+
+def test_foreground_without_todo_does_not_create_task_card(tmp_path):
+    plugin = _load_plugin()
+    manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0)
+
+    state = manager.on_gateway_activity(
+        context=_context(status=_CaptureStatus()),
+        activity_snapshot={
+            "kind": "foreground", "task_id": "fg_plain", "activity_id": "foreground:fg_plain",
+            "generation": "gen-plain", "revision": 1, "phase": "foreground-start", "status": "running",
+        },
+    )
+
+    assert state is None
+    assert list((tmp_path / "cards").glob("*.json")) == []
+
+
 def test_public_renderer_hides_generated_binding_and_diagnostic_summary(tmp_path):
     plugin = _load_plugin()
     manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0)
