@@ -19,6 +19,7 @@ import asyncio
 import dataclasses
 import hashlib
 import inspect
+import json
 import logging
 import os
 import re
@@ -42,6 +43,7 @@ from gateway.session import (
     is_shared_multi_user_session,
 )
 from hermes_cli.config import atomic_config_write, cfg_get, clear_model_endpoint_credentials
+from hermes_constants import get_hermes_home
 from utils import (
     atomic_json_write,
     base_url_host_matches,
@@ -967,6 +969,9 @@ class GatewaySlashCommandsMixin:
         from gateway.run import _AGENT_PENDING_SENTINEL
         from tools.process_registry import format_uptime_short, process_registry
 
+        if str(event.get_command() or "").strip().lower() == "tasks":
+            return self._render_tasks_index(event.source)
+
         now = time.time()
         current_session_key = self._session_key_for_source(event.source)
 
@@ -1051,6 +1056,92 @@ class GatewaySlashCommandsMixin:
             lines.append("")
             lines.append(t("gateway.agents.none"))
 
+        return "\n".join(lines)
+
+    def _render_tasks_index(self, source: SessionSource) -> str:
+        """Render a bounded, source-scoped active/recent task-card index."""
+        platform = str(getattr(source.platform, "value", source.platform) or "")
+        chat_id = str(source.chat_id or "")
+        thread_id = str(source.thread_id) if source.thread_id is not None else None
+        profile = str(source.profile or "") or None
+        home = get_hermes_home()
+        if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            try:
+                home = getattr(self, "_resolve_profile_home_for_source")(source)
+            except Exception:
+                logger.warning("Could not resolve profile home for /tasks", exc_info=True)
+
+        def belongs_to_source(record: dict[str, Any]) -> bool:
+            record_thread = record.get("thread_id")
+            normalized_thread = str(record_thread) if record_thread is not None else None
+            return (
+                str(record.get("platform") or "") == platform
+                and str(record.get("chat_id") or "") == chat_id
+                and normalized_thread == thread_id
+                and (not profile or record.get("profile") in {None, profile})
+            )
+
+        def summary(record: dict[str, Any], fallback: str) -> str:
+            value = str(record.get("summary") or fallback).replace("\n", " ").strip()
+            return value[:120] + ("…" if len(value) > 120 else "")
+
+        active: list[tuple[str, str]] = []
+        recent: list[tuple[str, str, str, str]] = []
+        try:
+            from gateway.background_task_ledger import BackgroundTaskLedger
+
+            ledger = BackgroundTaskLedger(home / "gateway")
+            for task_id, record in ledger.active_records().items():
+                if belongs_to_source(record):
+                    items = record.get("task_items") or []
+                    label = next(
+                        (
+                            str(item.get("content") or item.get("label") or "").strip()
+                            for item in items
+                            if isinstance(item, dict)
+                            and str(item.get("content") or item.get("label") or "").strip()
+                        ),
+                        "Background task in progress",
+                    )
+                    active.append((task_id, label[:120]))
+        except Exception:
+            logger.debug("Could not read active background task ledger", exc_info=True)
+
+        active_bindings = {f"background:{task_id}" for task_id, _ in active}
+        cards_dir = home / "plugins" / "task-card" / "cards"
+        try:
+            for path in cards_dir.glob("*.json"):
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if not isinstance(payload, dict) or not belongs_to_source(payload):
+                    continue
+                binding = str(payload.get("binding") or "task")
+                if payload.get("terminal"):
+                    recent.append((
+                        str(payload.get("updated_at") or ""),
+                        binding,
+                        summary(payload, "Task finished"),
+                        str(payload.get("status") or payload.get("phase") or "").lower(),
+                    ))
+                elif binding not in active_bindings:
+                    active.append((binding, summary(payload, "Task in progress")))
+        except OSError:
+            pass
+
+        active = active[:8]
+        recent.sort(reverse=True)
+        recent = recent[:8]
+        lines = ["📋 **Tasks**", "", f"**Active:** {len(active)}"]
+        lines.extend(f"- 🔄 `{task_id}` — {label}" for task_id, label in active)
+        lines.extend(["", f"**Recent:** {len(recent)}"])
+        lines.extend(
+            f"- {'❌' if state == 'failed' else '⏹️' if state == 'cancelled' else '✅'} `{binding}` — {label}"
+            for _, binding, label, state in recent
+        )
+        if not active and not recent:
+            lines.extend(["", "No active or recent tasks in this conversation."])
         return "\n".join(lines)
 
     async def _handle_stop_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
@@ -2639,6 +2730,8 @@ class GatewaySlashCommandsMixin:
         # Forward image/audio attachments so the background agent can see them.
         media_urls = list(event.media_urls) if event.media_urls else []
         media_types = list(event.media_types) if event.media_types else []
+
+        getattr(self, "_register_background_task_ledger")(source, task_id, event_message_id)
 
         # Fire-and-forget the background task
         _task = asyncio.create_task(

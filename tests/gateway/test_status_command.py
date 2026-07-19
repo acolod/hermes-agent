@@ -342,7 +342,66 @@ async def test_tasks_alias_routes_to_agents_command(monkeypatch):
 
     result = await runner._handle_message(_make_event("/tasks"))
 
-    assert "Active Agents & Tasks" in result
+    assert result is not None
+    assert "📋 **Tasks**" in result
+    assert "No active or recent tasks" in result
+
+
+@pytest.mark.asyncio
+async def test_tasks_index_is_source_scoped_and_lists_active_and_recent(monkeypatch, tmp_path):
+    import json
+    import gateway.slash_commands as slash_commands
+    from gateway.background_task_ledger import BackgroundTaskLedger
+
+    source = _make_source()
+    session_entry = SessionEntry(
+        session_key=build_session_key(source),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=0,
+    )
+    runner = _make_runner(session_entry)
+    runner._background_tasks = set()
+    monkeypatch.setattr(slash_commands, "get_hermes_home", lambda: tmp_path)
+    ledger = BackgroundTaskLedger(tmp_path / "gateway")
+    ledger.register(
+        "bg_visible",
+        {"platform": "telegram", "chat_id": "c1", "task_items": [{"content": "Inspect state"}]},
+    )
+    ledger.register("bg_hidden", {"platform": "telegram", "chat_id": "other"})
+    cards_dir = tmp_path / "plugins" / "task-card" / "cards"
+    cards_dir.mkdir(parents=True)
+    (cards_dir / "visible.json").write_text(
+        json.dumps(
+            {"binding": "background:bg_visible", "platform": "telegram", "chat_id": "c1", "terminal": False, "summary": "Duplicate active card"}
+        ),
+        encoding="utf-8",
+    )
+    (cards_dir / "recent.json").write_text(
+        json.dumps(
+            {"binding": "relay:recent", "platform": "telegram", "chat_id": "c1", "terminal": True, "status": "failed", "updated_at": "2026-07-19T12:00:00+00:00", "summary": "Relay failed"}
+        ),
+        encoding="utf-8",
+    )
+    (cards_dir / "hidden.json").write_text(
+        json.dumps(
+            {"binding": "relay:hidden", "platform": "telegram", "chat_id": "other", "terminal": True, "updated_at": "2026-07-19T13:00:00+00:00", "summary": "Must not leak"}
+        ),
+        encoding="utf-8",
+    )
+
+    result = await runner._handle_message(_make_event("/tasks"))
+
+    assert result is not None
+    assert "bg_visible" in result
+    assert "Inspect state" in result
+    assert "relay:recent" in result
+    assert "❌ `relay:recent`" in result
+    assert "Must not leak" not in result
+    assert "Duplicate active card" not in result
 
 
 @pytest.mark.asyncio

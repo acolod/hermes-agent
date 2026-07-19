@@ -234,12 +234,36 @@ def test_gateway_activity_helper_preserves_derived_reply_thread(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_terminal_publication_ack_stays_pending_when_registered_hook_returns_no_result(monkeypatch):
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {Platform.TELEGRAM: MagicMock()}
+    monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda _name: True)
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", MagicMock(return_value=[]))
+
+    acknowledgement = runner._emit_gateway_activity(
+        source=_source(),
+        session_key="telegram:chat-1:topic-9",
+        kind="background",
+        phase="failed",
+        status="failed",
+        summary="Failed",
+        terminal=True,
+        task_id="bg_hook_failure",
+    )
+
+    assert acknowledgement is not None
+    assert not acknowledgement.done()
+    acknowledgement.cancel()
+
+
+@pytest.mark.asyncio
 async def test_terminal_publication_ack_true_is_quiet(caplog):
     runner = object.__new__(GatewayRunner)
     acknowledgement = asyncio.get_running_loop().create_future()
     acknowledgement.set_result(True)
     with caplog.at_level(logging.WARNING, logger="gateway.run"):
-        await runner._await_terminal_card_publication(acknowledgement)
+        result = await runner._await_terminal_card_publication(acknowledgement)
+    assert result is True
     assert "Terminal Task Card publication" not in caplog.text
 
 
@@ -249,7 +273,8 @@ async def test_terminal_publication_ack_false_warns(caplog):
     acknowledgement = asyncio.get_running_loop().create_future()
     acknowledgement.set_result(False)
     with caplog.at_level(logging.WARNING, logger="gateway.run"):
-        await runner._await_terminal_card_publication(acknowledgement)
+        result = await runner._await_terminal_card_publication(acknowledgement)
+    assert result is False
     assert "Terminal Task Card publication was not accepted" in caplog.text
 
 
@@ -263,9 +288,16 @@ async def test_terminal_publication_ack_timeout_warns(monkeypatch, caplog):
 
     monkeypatch.setattr("gateway.run.asyncio.wait_for", _timeout)
     with caplog.at_level(logging.WARNING, logger="gateway.run"):
-        await runner._await_terminal_card_publication(acknowledgement)
+        result = await runner._await_terminal_card_publication(acknowledgement)
+    assert result is False
     assert "Terminal Task Card publication timed out after 10s" in caplog.text
     acknowledgement.cancel()
+
+
+@pytest.mark.asyncio
+async def test_terminal_publication_without_acknowledgement_is_accepted():
+    runner = object.__new__(GatewayRunner)
+    assert await runner._await_terminal_card_publication(None) is True
 
 
 @pytest.mark.asyncio

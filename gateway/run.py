@@ -7406,6 +7406,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self.delivery_router.adapters = self.adapters
         self._wire_teams_pipeline_runtime()
         await self._start_status_ingress()
+        await self._reconcile_interrupted_background_tasks()
 
         self._running = True
         self._update_runtime_status("running")
@@ -13678,6 +13679,124 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
 
 
+    async def _reconcile_interrupted_background_tasks(self) -> None:
+        """Terminally reconcile active background tasks left by a prior process."""
+        from gateway.background_task_ledger import BackgroundTaskLedger
+
+        profile_homes = [(None, get_hermes_home())]
+        if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            try:
+                from hermes_cli.profiles import profiles_to_serve
+
+                profile_homes = list(profiles_to_serve(multiplex=True))
+            except Exception:
+                logger.warning("Could not enumerate profile homes for background reconciliation", exc_info=True)
+        for profile_name, profile_home in profile_homes:
+            with _profile_runtime_scope(profile_home):
+                ledger = BackgroundTaskLedger(profile_home / "gateway")
+                await self._reconcile_background_ledger(ledger, profile_name)
+
+    def _background_task_ledger_for_source(self, source: SessionSource):
+        from gateway.background_task_ledger import BackgroundTaskLedger
+
+        ledger_home = get_hermes_home()
+        if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            try:
+                ledger_home = self._resolve_profile_home_for_source(source)
+            except Exception:
+                logger.warning("Could not resolve profile home for background task ledger", exc_info=True)
+        return BackgroundTaskLedger(ledger_home / "gateway")
+
+    def _register_background_task_ledger(
+        self, source: SessionSource, task_id: str, event_message_id: Optional[str]
+    ) -> Any:
+        ledger = self._background_task_ledger_for_source(source)
+        ledger.register(
+            task_id,
+            {
+                "platform": str(getattr(source.platform, "value", source.platform)),
+                "chat_id": str(source.chat_id),
+                "user_id": source.user_id,
+                "chat_type": source.chat_type,
+                "thread_id": source.thread_id,
+                "profile": source.profile,
+                "session_key": self._session_key_for_source(source),
+                "event_message_id": event_message_id,
+                "started_at": time.time(),
+                "task_items": [],
+            },
+        )
+        return ledger
+
+    async def _reconcile_background_ledger(
+        self,
+        ledger: Any,
+        profile_name: Optional[str],
+    ) -> None:
+        await asyncio.gather(
+            *(
+                self._reconcile_background_record(ledger, profile_name, task_id, record)
+                for task_id, record in ledger.active_records().items()
+            )
+        )
+
+    async def _reconcile_background_record(
+        self,
+        ledger: Any,
+        profile_name: Optional[str],
+        task_id: str,
+        record: dict[str, Any],
+    ) -> None:
+        try:
+            platform_value = record.get("platform")
+            chat_id = record.get("chat_id")
+            if not task_id.startswith(("bg_", "bg-")) or not platform_value or not chat_id:
+                raise ValueError("missing task routing fields")
+            source = SessionSource(
+                platform=Platform(str(platform_value)),
+                chat_id=str(chat_id),
+                user_id=record.get("user_id"),
+                chat_type=record.get("chat_type") or "dm",
+                thread_id=record.get("thread_id"),
+                profile=record.get("profile") or profile_name,
+            )
+        except Exception as exc:
+            logger.warning("Discarding malformed background ledger record %s: %s", task_id, exc)
+            ledger.clear(task_id)
+            return
+        try:
+            items = []
+            for item in record.get("task_items") or []:
+                if not isinstance(item, dict):
+                    continue
+                restored = dict(item)
+                if str(restored.get("status", "")).lower() not in {"done", "complete", "completed"}:
+                    restored["status"] = "failed"
+                items.append(restored)
+            items.append({"id": "gateway-interrupted", "content": "Gateway refreshed before completion", "status": "failed"})
+            session_key = record.get("session_key") or self._session_key_for_source(source)
+            generation = str(record.get("lifecycle_generation") or "").strip()
+            revision = record.get("lifecycle_revision")
+            if generation and isinstance(revision, int) and revision > 0:
+                lifecycles = getattr(self, "_task_card_lifecycles", None)
+                if lifecycles is None:
+                    lifecycles = {}
+                    self._task_card_lifecycles = lifecycles
+                lifecycles[f"background:{task_id}"] = {
+                    "generation": generation,
+                    "revision": revision,
+                }
+            acknowledgement = self._emit_gateway_activity(
+                source=source, session_key=session_key, kind="background",
+                phase="cancelled", status="cancelled",
+                summary="Background task interrupted by gateway refresh", terminal=True,
+                task_id=task_id, event_message_id=record.get("event_message_id"), task_items=items,
+            )
+            if await self._await_terminal_card_publication(acknowledgement):
+                ledger.clear(task_id)
+        except Exception:
+            logger.warning("Background task reconciliation failed for %s", task_id, exc_info=True)
+
     async def _run_background_task(
         self,
         prompt: str,
@@ -13710,11 +13829,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
 
         _thread_metadata = self._thread_metadata_for_source(source, event_message_id)
+        _background_ledger = self._register_background_task_ledger(source, task_id, event_message_id)
+        lifecycle = getattr(self, "_task_card_lifecycles", {}).get(f"background:{task_id}")
+        if isinstance(lifecycle, dict):
+            _background_ledger.update_metadata(
+                task_id,
+                lifecycle_generation=lifecycle.get("generation"),
+                lifecycle_revision=lifecycle.get("revision"),
+            )
         current_run_todo_items: list[Optional[list[dict[str, Any]]]] = [None]
         terminal_activity_emitted = False
         gateway_loop = asyncio.get_running_loop()
 
         def _emit_background_todo_update(todos: list[dict[str, Any]]) -> None:
+            _background_ledger.update_todos(task_id, todos)
             self._emit_gateway_activity(
                 source=source,
                 session_key=self._session_key_for_source(source),
@@ -13727,6 +13855,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 event_message_id=event_message_id,
                 task_items=todos,
             )
+            lifecycle = getattr(self, "_task_card_lifecycles", {}).get(f"background:{task_id}")
+            if isinstance(lifecycle, dict):
+                _background_ledger.update_metadata(
+                    task_id,
+                    lifecycle_generation=lifecycle.get("generation"),
+                    lifecycle_revision=lifecycle.get("revision"),
+                )
 
         def _background_step_callback_sync(_iteration: int, previous_tools: list) -> None:
             for tool in previous_tools or []:
@@ -13768,7 +13903,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     event_message_id=event_message_id,
                 )
                 terminal_activity_emitted = True
-                await self._await_terminal_card_publication(publication_ack)
+                if await self._await_terminal_card_publication(publication_ack):
+                    _background_ledger.clear(task_id)
                 await adapter.send(
                     source.chat_id,
                     f"❌ Background task {task_id} failed: no provider credentials configured.",
@@ -13888,7 +14024,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 task_items=(result.get("task_items") if isinstance(result, dict) and result.get("task_items_observed") else None),
             )
             terminal_activity_emitted = True
-            await self._await_terminal_card_publication(publication_ack)
+            if await self._await_terminal_card_publication(publication_ack):
+                _background_ledger.clear(task_id)
 
             # Extract media files from the response
             if response:
@@ -13983,7 +14120,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 event_message_id=event_message_id,
                 task_items=current_run_todo_items[0],
             )
-            await self._await_terminal_card_publication(publication_ack)
+            if await self._await_terminal_card_publication(publication_ack):
+                _background_ledger.clear(task_id)
             raise
         except Exception as e:
             if terminal_activity_emitted:
@@ -14002,7 +14140,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 event_message_id=event_message_id,
                 task_items=current_run_todo_items[0],
             )
-            await self._await_terminal_card_publication(publication_ack)
+            if await self._await_terminal_card_publication(publication_ack):
+                _background_ledger.clear(task_id)
             try:
                 await adapter.send(
                     chat_id=source.chat_id,
@@ -17541,7 +17680,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ) -> Optional[asyncio.Future]:
         """Emit a bounded lifecycle observation to contextual plugins."""
         try:
-            from hermes_cli.plugins import build_plugin_command_context, invoke_hook
+            from hermes_cli.plugins import build_plugin_command_context, has_hook, invoke_hook
 
             snapshot: Dict[str, Any] = {
                 "kind": str(kind)[:64],
@@ -17617,21 +17756,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 activity_snapshot=snapshot,
                 terminal=bool(terminal),
             )
+            if publication_ack is not None and not has_hook("gateway_activity") and not publication_ack.done():
+                publication_ack.set_result(True)
             logger.info("task-card activity: task=%s platform=%s chat=%s revision=%s phase=%s", snapshot.get("task_id"), getattr(source.platform, "value", source.platform), source.chat_id, snapshot["revision"], snapshot["phase"])
             return publication_ack
         except Exception as exc:
             logger.warning("gateway_activity hook invocation failed: %s", exc)
             return None
 
-    async def _await_terminal_card_publication(self, publication_ack: Optional[asyncio.Future]) -> None:
+    async def _await_terminal_card_publication(self, publication_ack: Optional[asyncio.Future]) -> bool:
         if publication_ack is None:
-            return
+            return True
         try:
             published = await asyncio.wait_for(asyncio.shield(publication_ack), timeout=10.0)
             if not published:
                 logger.warning("Terminal Task Card publication was not accepted")
+                return False
+            return True
         except asyncio.TimeoutError:
             logger.warning("Terminal Task Card publication timed out after 10s")
+            return False
 
     async def _start_status_ingress(self) -> None:
         """Start the single local status ingress on the gateway-owned loop."""

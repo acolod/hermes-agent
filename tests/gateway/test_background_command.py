@@ -38,6 +38,8 @@ def _make_runner():
     runner._fallback_model = None
     runner._running_agents = {}
     runner._background_tasks = set()
+    runner._background_task_ledger_for_source = GatewayRunner._background_task_ledger_for_source.__get__(runner)
+    runner._register_background_task_ledger = GatewayRunner._register_background_task_ledger.__get__(runner)
 
     mock_store = MagicMock()
     runner.session_store = mock_store
@@ -86,6 +88,8 @@ class TestHandleBackgroundCommand:
         """Running /background with a prompt returns confirmation and starts task."""
         runner = _make_runner()
         runner._emit_gateway_activity = MagicMock(return_value=None)
+        runner._register_background_task_ledger = MagicMock()
+
 
         # Patch asyncio.create_task to capture the coroutine
         created_tasks = []
@@ -107,6 +111,7 @@ class TestHandleBackgroundCommand:
         assert "bg_" in result  # task ID starts with bg_
         assert "Summarize the top HN stories" in result
         assert len(created_tasks) == 1  # background task was created
+        runner._register_background_task_ledger.assert_called_once()
         lifecycle = runner._emit_gateway_activity.call_args.kwargs
         assert lifecycle["kind"] == "background"
         assert lifecycle["phase"] == "background-start"
@@ -686,6 +691,286 @@ class TestRunBackgroundTask:
         content = call_args[1].get("content", call_args[0][1] if len(call_args[0]) > 1 else "")
         assert "failed" in content.lower()
 
+
+
+    @pytest.mark.asyncio
+    async def test_startup_reconciliation_settles_and_clears_interrupted_task(self, monkeypatch, tmp_path):
+        from gateway import run as gateway_run
+        from gateway.background_task_ledger import BackgroundTaskLedger
+
+        runner = _make_runner()
+        monkeypatch.setattr(gateway_run, "get_hermes_home", lambda: tmp_path)
+        ledger = BackgroundTaskLedger(tmp_path / "gateway")
+        ledger.register(
+            "bg_recover",
+            {
+                "platform": Platform.TELEGRAM.value,
+                "chat_id": "chat-1",
+                "user_id": "user-1",
+                "chat_type": "group",
+                "thread_id": "thread-1",
+                "session_key": "session-1",
+                "event_message_id": "42",
+                "task_items": [
+                    {"id": "done", "content": "Already done", "status": "done"},
+                    {"id": "pending", "content": "Still pending", "status": "pending"},
+                ],
+            },
+        )
+        events = []
+        loop = asyncio.get_running_loop()
+
+        def emit(**kwargs):
+            events.append(kwargs)
+            acknowledgement = loop.create_future()
+            acknowledgement.set_result(True)
+            return acknowledgement
+
+        runner._emit_gateway_activity = emit
+        await runner._reconcile_interrupted_background_tasks()
+        assert len(events) == 1
+        event = events[0]
+        assert event["kind"] == "background"
+        assert event["task_id"] == "bg_recover"
+        assert event["phase"] == event["status"] == "cancelled"
+        assert event["terminal"] is True
+        assert event["event_message_id"] == "42"
+        items = {item["id"]: item for item in event["task_items"]}
+        assert items["done"]["status"] == "done"
+        assert items["pending"]["status"] == "failed"
+        assert items["gateway-interrupted"]["status"] == "failed"
+        assert ledger.active_records() == {}
+
+        await runner._reconcile_interrupted_background_tasks()
+        assert len(events) == 1
+
+    @pytest.mark.asyncio
+    async def test_reconciliation_retains_false_acknowledgement_and_discards_malformed_record(
+        self, monkeypatch, tmp_path
+    ):
+        from gateway import run as gateway_run
+        from gateway.background_task_ledger import BackgroundTaskLedger
+
+        runner = _make_runner()
+        monkeypatch.setattr(gateway_run, "get_hermes_home", lambda: tmp_path)
+        ledger = BackgroundTaskLedger(tmp_path / "gateway")
+        ledger.register(
+            "bg_retain",
+            {"platform": Platform.TELEGRAM.value, "chat_id": "chat-1"},
+        )
+        ledger.register("bg_malformed", {"platform": Platform.TELEGRAM.value})
+        acknowledgement = asyncio.get_running_loop().create_future()
+        acknowledgement.set_result(False)
+        runner._emit_gateway_activity = MagicMock(return_value=acknowledgement)
+
+        await runner._reconcile_interrupted_background_tasks()
+
+        assert set(ledger.active_records()) == {"bg_retain"}
+        runner._emit_gateway_activity.assert_called_once()
+        assert runner._emit_gateway_activity.call_args.kwargs["task_id"] == "bg_retain"
+
+    @pytest.mark.asyncio
+    async def test_reconciliation_isolates_mixed_terminal_acknowledgements(
+        self, monkeypatch, tmp_path
+    ):
+        from gateway import run as gateway_run
+        from gateway.background_task_ledger import BackgroundTaskLedger
+
+        runner = _make_runner()
+        monkeypatch.setattr(gateway_run, "get_hermes_home", lambda: tmp_path)
+        ledger = BackgroundTaskLedger(tmp_path / "gateway")
+        for task_id in ("bg_clear", "bg_retain"):
+            ledger.register(
+                task_id,
+                {"platform": Platform.TELEGRAM.value, "chat_id": task_id},
+            )
+
+        loop = asyncio.get_running_loop()
+
+        def emit(**kwargs):
+            acknowledgement = loop.create_future()
+            acknowledgement.set_result(kwargs["task_id"] == "bg_clear")
+            return acknowledgement
+
+        runner._emit_gateway_activity = MagicMock(side_effect=emit)
+        await runner._reconcile_interrupted_background_tasks()
+
+        assert set(ledger.active_records()) == {"bg_retain"}
+        assert {
+            call.kwargs["task_id"] for call in runner._emit_gateway_activity.call_args_list
+        } == {"bg_clear", "bg_retain"}
+
+    @pytest.mark.asyncio
+    async def test_reconciliation_awaits_terminal_publications_concurrently(self, monkeypatch, tmp_path):
+        from gateway import run as gateway_run
+        from gateway.background_task_ledger import BackgroundTaskLedger
+
+        runner = _make_runner()
+        monkeypatch.setattr(gateway_run, "get_hermes_home", lambda: tmp_path)
+        ledger = BackgroundTaskLedger(tmp_path / "gateway")
+        for task_id in ("bg_one", "bg_two"):
+            ledger.register(task_id, {"platform": Platform.TELEGRAM.value, "chat_id": task_id})
+
+        release = asyncio.Event()
+        both_awaiting = asyncio.Event()
+        awaiting = set()
+
+        async def await_publication(acknowledgement):
+            awaiting.add(acknowledgement)
+            if len(awaiting) == 2:
+                both_awaiting.set()
+            await release.wait()
+            return True
+
+        runner._emit_gateway_activity = MagicMock(side_effect=lambda **kwargs: kwargs["task_id"])
+        runner._await_terminal_card_publication = AsyncMock(side_effect=await_publication)
+        reconciliation = asyncio.create_task(runner._reconcile_interrupted_background_tasks())
+        try:
+            await asyncio.wait_for(both_awaiting.wait(), timeout=0.1)
+            assert awaiting == {"bg_one", "bg_two"}
+        finally:
+            release.set()
+            await reconciliation
+        assert ledger.active_records() == {}
+
+    @pytest.mark.asyncio
+    async def test_background_ledger_uses_routed_profile_home(self, monkeypatch, tmp_path):
+        from gateway import run as gateway_run
+        from gateway.background_task_ledger import BackgroundTaskLedger
+
+        runner = _make_runner()
+        runner.config = MagicMock(multiplex_profiles=True)
+        profile_home = tmp_path / "profiles" / "reviewer"
+        runner._resolve_profile_home_for_source = MagicMock(return_value=profile_home)
+        monkeypatch.setattr(gateway_run, "get_hermes_home", lambda: tmp_path)
+        adapter = AsyncMock()
+        adapter.send = AsyncMock()
+        runner.adapters[Platform.TELEGRAM] = adapter
+        runner._adapter_for_source = MagicMock(return_value=adapter)
+        runner._resolve_session_agent_runtime = MagicMock(return_value=("test-model", {}))
+        acknowledgement = asyncio.get_running_loop().create_future()
+        acknowledgement.set_result(False)
+        runner._emit_gateway_activity = MagicMock(return_value=acknowledgement)
+
+        await runner._run_background_task(
+            "fail",
+            SessionSource(platform=Platform.TELEGRAM, user_id="user", chat_id="chat", profile="reviewer"),
+            "bg_profile",
+        )
+
+        assert "bg_profile" in BackgroundTaskLedger(profile_home / "gateway").active_records()
+        assert BackgroundTaskLedger(tmp_path / "gateway").active_records() == {}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("acknowledgement", [True, False, "timeout"])
+    async def test_failed_background_terminal_clears_ledger_only_after_acknowledgement(
+        self, monkeypatch, tmp_path, acknowledgement
+    ):
+        from gateway import run as gateway_run
+        from gateway.background_task_ledger import BackgroundTaskLedger
+
+        runner = _make_runner()
+        monkeypatch.setattr(gateway_run, "get_hermes_home", lambda: tmp_path)
+        adapter = AsyncMock()
+        adapter.send = AsyncMock()
+        runner.adapters[Platform.TELEGRAM] = adapter
+        source = SessionSource(platform=Platform.TELEGRAM, user_id="user", chat_id="chat")
+
+        if acknowledgement == "timeout":
+            runner._emit_gateway_activity = MagicMock(return_value=object())
+            runner._await_terminal_card_publication = AsyncMock(return_value=False)
+        else:
+            future = asyncio.get_running_loop().create_future()
+            future.set_result(acknowledgement)
+            runner._emit_gateway_activity = MagicMock(return_value=future)
+
+        runner._resolve_session_agent_runtime = MagicMock(return_value=("test-model", {}))
+        await runner._run_background_task("fail", source, "bg_failed")
+
+        records = BackgroundTaskLedger(tmp_path / "gateway").active_records()
+        assert ("bg_failed" not in records) is (acknowledgement is True)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("acknowledgement", [True, False, "timeout"])
+    async def test_completed_background_terminal_clears_ledger_only_after_acknowledgement(
+        self, monkeypatch, tmp_path, acknowledgement
+    ):
+        from gateway import run as gateway_run
+        from gateway.background_task_ledger import BackgroundTaskLedger
+
+        runner = _make_runner()
+        monkeypatch.setattr(gateway_run, "get_hermes_home", lambda: tmp_path)
+        adapter = AsyncMock()
+        adapter.send = AsyncMock()
+        adapter.extract_media = MagicMock(return_value=([], "done"))
+        adapter.extract_images = MagicMock(return_value=([], "done"))
+        runner.adapters[Platform.TELEGRAM] = adapter
+        source = SessionSource(platform=Platform.TELEGRAM, user_id="user", chat_id="chat")
+
+        if acknowledgement == "timeout":
+            runner._emit_gateway_activity = MagicMock(return_value=object())
+            runner._await_terminal_card_publication = AsyncMock(return_value=False)
+        else:
+            future = asyncio.get_running_loop().create_future()
+            future.set_result(acknowledgement)
+            runner._emit_gateway_activity = MagicMock(return_value=future)
+
+        runner._resolve_session_agent_runtime = MagicMock(
+            return_value=("test-model", {"api_key": "test-key"})
+        )
+        runner._resolve_session_reasoning_config = MagicMock(return_value=None)
+        runner._load_service_tier = MagicMock(return_value=None)
+        runner._resolve_turn_agent_config = MagicMock(
+            return_value={"model": "test-model", "runtime": {}, "request_overrides": None}
+        )
+        runner._run_in_executor_with_context = AsyncMock(
+            return_value={"final_response": "done", "messages": []}
+        )
+        monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+        await runner._run_background_task("complete", source, "bg_completed")
+
+        records = BackgroundTaskLedger(tmp_path / "gateway").active_records()
+        assert ("bg_completed" not in records) is (acknowledgement is True)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("acknowledgement", [True, False, "timeout"])
+    async def test_cancelled_background_terminal_clears_ledger_only_after_acknowledgement(
+        self, monkeypatch, tmp_path, acknowledgement
+    ):
+        from gateway import run as gateway_run
+        from gateway.background_task_ledger import BackgroundTaskLedger
+
+        runner = _make_runner()
+        monkeypatch.setattr(gateway_run, "get_hermes_home", lambda: tmp_path)
+        adapter = AsyncMock()
+        adapter.send = AsyncMock()
+        runner.adapters[Platform.TELEGRAM] = adapter
+        source = SessionSource(platform=Platform.TELEGRAM, user_id="user", chat_id="chat")
+
+        if acknowledgement == "timeout":
+            runner._emit_gateway_activity = MagicMock(return_value=object())
+            runner._await_terminal_card_publication = AsyncMock(return_value=False)
+        else:
+            future = asyncio.get_running_loop().create_future()
+            future.set_result(acknowledgement)
+            runner._emit_gateway_activity = MagicMock(return_value=future)
+
+        runner._resolve_session_agent_runtime = MagicMock(
+            return_value=("test-model", {"api_key": "test-key"})
+        )
+        runner._resolve_session_reasoning_config = MagicMock(return_value=None)
+        runner._load_service_tier = MagicMock(return_value=None)
+        runner._resolve_turn_agent_config = MagicMock(
+            return_value={"model": "test-model", "runtime": {}, "request_overrides": None}
+        )
+        runner._run_in_executor_with_context = AsyncMock(side_effect=asyncio.CancelledError)
+        monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+
+        with pytest.raises(asyncio.CancelledError):
+            await runner._run_background_task("cancel", source, "bg_cancelled")
+
+        records = BackgroundTaskLedger(tmp_path / "gateway").active_records()
+        assert ("bg_cancelled" not in records) is (acknowledgement is True)
 
 # ---------------------------------------------------------------------------
 # /background in help and known_commands

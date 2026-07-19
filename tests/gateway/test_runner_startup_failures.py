@@ -118,6 +118,33 @@ async def test_runner_allows_cron_only_mode_when_no_platforms_are_enabled(monkey
 
 
 @pytest.mark.asyncio
+async def test_startup_orders_status_ingress_then_reconciliation_before_running_and_hooks(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner = GatewayRunner(GatewayConfig(platforms={}, sessions_dir=tmp_path / "sessions"))
+    order = []
+
+    async def start_status_ingress():
+        order.append("status-ingress")
+
+    async def reconcile():
+        order.append("reconciliation")
+
+    async def emit(*args, **kwargs):
+        assert args[0] == "gateway:startup"
+        assert runner._running is True
+        order.append("hooks")
+
+    monkeypatch.setattr(runner, "_start_status_ingress", start_status_ingress)
+    monkeypatch.setattr(runner, "_reconcile_interrupted_background_tasks", reconcile)
+    monkeypatch.setattr(runner.hooks, "emit", emit)
+
+    assert await runner.start() is True
+    assert order == ["status-ingress", "reconciliation", "hooks"]
+
+
+@pytest.mark.asyncio
 async def test_runner_records_connected_platform_state_on_success(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     config = GatewayConfig(
