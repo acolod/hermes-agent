@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -24,7 +26,15 @@ def _source() -> SessionSource:
 def _runner(result=None, error: Exception | None = None):
     runner = object.__new__(GatewayRunner)
     runner.config = SimpleNamespace(multiplex_profiles=False)
-    runner._emit_gateway_activity = MagicMock()
+
+    def _emit(**kwargs):
+        if not kwargs.get("terminal"):
+            return None
+        acknowledgement = __import__("asyncio").get_running_loop().create_future()
+        acknowledgement.set_result(True)
+        return acknowledgement
+
+    runner._emit_gateway_activity = MagicMock(side_effect=_emit)
     if error is None:
         runner._run_agent_inner = AsyncMock(return_value=result or {"final_response": "done"})
     else:
@@ -221,3 +231,38 @@ def test_gateway_activity_helper_preserves_derived_reply_thread(monkeypatch):
     assert context.origin.thread_id == "derived-thread"
     assert context.status.thread_id == "derived-thread"
     runner._thread_metadata_for_source.assert_called_once_with(source, "event-123")
+
+
+@pytest.mark.asyncio
+async def test_terminal_publication_ack_true_is_quiet(caplog):
+    runner = object.__new__(GatewayRunner)
+    acknowledgement = asyncio.get_running_loop().create_future()
+    acknowledgement.set_result(True)
+    with caplog.at_level(logging.WARNING, logger="gateway.run"):
+        await runner._await_terminal_card_publication(acknowledgement)
+    assert "Terminal Task Card publication" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_terminal_publication_ack_false_warns(caplog):
+    runner = object.__new__(GatewayRunner)
+    acknowledgement = asyncio.get_running_loop().create_future()
+    acknowledgement.set_result(False)
+    with caplog.at_level(logging.WARNING, logger="gateway.run"):
+        await runner._await_terminal_card_publication(acknowledgement)
+    assert "Terminal Task Card publication was not accepted" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_terminal_publication_ack_timeout_warns(monkeypatch, caplog):
+    runner = object.__new__(GatewayRunner)
+    acknowledgement = asyncio.get_running_loop().create_future()
+
+    async def _timeout(*_args, **_kwargs):
+        raise asyncio.TimeoutError
+
+    monkeypatch.setattr("gateway.run.asyncio.wait_for", _timeout)
+    with caplog.at_level(logging.WARNING, logger="gateway.run"):
+        await runner._await_terminal_card_publication(acknowledgement)
+    assert "Terminal Task Card publication timed out after 10s" in caplog.text
+    acknowledgement.cancel()

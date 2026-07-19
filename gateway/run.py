@@ -17486,7 +17486,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         task_id: Optional[str] = None,
         event_message_id: Optional[str] = None,
         task_items: Optional[List[Dict[str, Any]]] = None,
-    ) -> None:
+    ) -> Optional[asyncio.Future]:
         """Emit a bounded lifecycle observation to contextual plugins."""
         try:
             from hermes_cli.plugins import build_plugin_command_context, invoke_hook
@@ -17536,6 +17536,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         status_metadata=dict(thread_metadata or {}),
                     )
                 )
+            publication_ack = None
+            if terminal and kind == "foreground":
+                publication_ack = asyncio.get_running_loop().create_future()
             context = build_plugin_command_context(
                 command="gateway_activity",
                 raw_args="",
@@ -17547,6 +17550,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 metadata={
                     "surface": "gateway_activity",
                     "kind": snapshot["kind"],
+                    **({"_status_ingress_ack": publication_ack} if publication_ack is not None else {}),
                     **(
                         {"status_origin_handle": status_origin_handle}
                         if status_origin_handle is not None
@@ -17562,8 +17566,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 terminal=bool(terminal),
             )
             logger.info("task-card activity: task=%s platform=%s chat=%s revision=%s phase=%s", snapshot.get("task_id"), getattr(source.platform, "value", source.platform), source.chat_id, snapshot["revision"], snapshot["phase"])
+            return publication_ack
         except Exception as exc:
             logger.warning("gateway_activity hook invocation failed: %s", exc)
+            return None
+
+    async def _await_terminal_card_publication(self, publication_ack: Optional[asyncio.Future]) -> None:
+        if publication_ack is None:
+            return
+        try:
+            published = await asyncio.wait_for(asyncio.shield(publication_ack), timeout=10.0)
+            if not published:
+                logger.warning("Terminal Task Card publication was not accepted")
+        except asyncio.TimeoutError:
+            logger.warning("Terminal Task Card publication timed out after 10s")
 
     async def _start_status_ingress(self) -> None:
         """Start the single local status ingress on the gateway-owned loop."""
@@ -17722,7 +17738,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         persist_user_timestamp=persist_user_timestamp,
                     )
         except asyncio.CancelledError:
-            self._emit_gateway_activity(
+            publication_ack = self._emit_gateway_activity(
                 source=source,
                 session_key=session_key,
                 kind="foreground",
@@ -17733,9 +17749,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 task_id=task_card_task_id,
                 event_message_id=event_message_id,
             )
+            await self._await_terminal_card_publication(publication_ack)
             raise
         except Exception:
-            self._emit_gateway_activity(
+            publication_ack = self._emit_gateway_activity(
                 source=source,
                 session_key=session_key,
                 kind="foreground",
@@ -17746,6 +17763,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 task_id=task_card_task_id,
                 event_message_id=event_message_id,
             )
+            await self._await_terminal_card_publication(publication_ack)
             raise
 
         interrupted = bool(isinstance(result, dict) and result.get("interrupted"))
@@ -17758,7 +17776,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 or (result.get("error") and not result.get("final_response"))
             )
         )
-        self._emit_gateway_activity(
+        publication_ack = self._emit_gateway_activity(
             source=source,
             session_key=session_key,
             kind="foreground",
@@ -17778,6 +17796,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else None
             ),
         )
+        await self._await_terminal_card_publication(publication_ack)
         return result
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
