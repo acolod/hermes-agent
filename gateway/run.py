@@ -17703,6 +17703,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         change for single-profile gateways.
         """
         task_card_task_id = f"fg_{uuid.uuid4().hex}"
+        current_run_todo_items = [None]  # Current-run Todo data only; never hydrate from history.
         self._emit_gateway_activity(
             source=source,
             session_key=session_key,
@@ -17724,6 +17725,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     channel_prompt=channel_prompt, moa_config=moa_config,
                     persist_user_message=persist_user_message,
                     persist_user_timestamp=persist_user_timestamp,
+                    current_run_todo_items=current_run_todo_items,
                 )
             else:
                 profile_home = self._resolve_profile_home_for_source(source)
@@ -17736,6 +17738,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         channel_prompt=channel_prompt, moa_config=moa_config,
                         persist_user_message=persist_user_message,
                         persist_user_timestamp=persist_user_timestamp,
+                        current_run_todo_items=current_run_todo_items,
                     )
         except asyncio.CancelledError:
             publication_ack = self._emit_gateway_activity(
@@ -17748,6 +17751,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 terminal=True,
                 task_id=task_card_task_id,
                 event_message_id=event_message_id,
+                task_items=current_run_todo_items[0],
             )
             await self._await_terminal_card_publication(publication_ack)
             raise
@@ -17762,6 +17766,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 terminal=True,
                 task_id=task_card_task_id,
                 event_message_id=event_message_id,
+                task_items=current_run_todo_items[0],
             )
             await self._await_terminal_card_publication(publication_ack)
             raise
@@ -17791,9 +17796,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             task_id=task_card_task_id,
             event_message_id=event_message_id,
             task_items=(
-                result.get("task_items")
-                if isinstance(result, dict) and result.get("task_items_observed")
-                else None
+                current_run_todo_items[0]
+                if current_run_todo_items[0] is not None
+                else (
+                    result.get("task_items")
+                    if isinstance(result, dict) and result.get("task_items_observed")
+                    else None
+                )
             ),
         )
         await self._await_terminal_card_publication(publication_ack)
@@ -17913,6 +17922,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str = None,
         run_generation: Optional[int] = None,
         task_card_task_id: Optional[str] = None,
+        current_run_todo_items: Optional[List[Optional[List[Dict[str, Any]]]]] = None,
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
@@ -18791,6 +18801,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         result_holder = [None]  # Mutable container for the result
         tools_holder = [None]   # Mutable container for the tool definitions
         stream_consumer_holder = [None]  # Mutable container for stream consumer
+        current_run_todo_items = current_run_todo_items or [None]
         
         # Bridge sync step_callback → async hooks.emit for agent:step events
         _loop_for_step = asyncio.get_running_loop()
@@ -18818,6 +18829,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 _parsed = _raw
                             _todos = _parsed.get("todos") if isinstance(_parsed, dict) else None
                             if isinstance(_todos, list):
+                                current_run_todo_items[0] = list(_todos)
                                 _task_card_active[0] = True
                                 logger.info("task-card todo activation: task=%s items=%d", task_card_task_id, len(_todos))
                                 _loop_for_step.call_soon_threadsafe(
@@ -20195,15 +20207,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 int(getattr(agent, "_task_card_turn_start_index", 0)),
             )
             _turn_messages = _turn_messages[_turn_start_index:]
-            _todo_items = []
+            _todo_items = current_run_todo_items[0] or []
             _todo_observed = any(
                 isinstance(message, dict) and message.get("role") == "tool"
                 and "todo" in str(message.get("name") or "")
                 for message in _turn_messages
             )
-            if _todo_observed:
+            if _todo_observed and not _todo_items:
                 _todo_store = getattr(agent, "_todo_store", None)
                 _todo_items = _todo_store.read() if _todo_store is not None else []
+            _todo_observed = bool(current_run_todo_items[0]) or _todo_observed
             return {
                 "final_response": final_response,
                 "last_reasoning": result.get("last_reasoning"),

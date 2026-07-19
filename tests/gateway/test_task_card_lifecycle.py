@@ -266,3 +266,35 @@ async def test_terminal_publication_ack_timeout_warns(monkeypatch, caplog):
         await runner._await_terminal_card_publication(acknowledgement)
     assert "Terminal Task Card publication timed out after 10s" in caplog.text
     acknowledgement.cancel()
+
+
+@pytest.mark.asyncio
+async def test_failed_terminal_carries_current_todo_snapshot():
+    runner = _runner()
+    todos = [{"id": "current", "content": "Current task", "status": "in_progress"}]
+
+    async def _fail(*_args, **kwargs):
+        kwargs["current_run_todo_items"][0] = todos
+        raise RuntimeError("boom")
+
+    runner._run_agent_inner = _fail
+    with pytest.raises(RuntimeError, match="boom"):
+        await runner._run_agent("hello", "", [], _source(), "session")
+    failed = [call.kwargs for call in runner._emit_gateway_activity.call_args_list if call.kwargs.get("phase") == "failed"]
+    assert failed[0]["task_items"] == todos
+
+
+@pytest.mark.asyncio
+async def test_cancelled_terminal_carries_current_todo_snapshot():
+    runner = _runner()
+    todos = [{"id": "current", "content": "Current task", "status": "in_progress"}]
+
+    async def _cancel(*_args, **kwargs):
+        kwargs["current_run_todo_items"][0] = todos
+        raise asyncio.CancelledError
+
+    runner._run_agent_inner = _cancel
+    with pytest.raises(asyncio.CancelledError):
+        await runner._run_agent("hello", "", [], _source(), "session")
+    cancelled = [call.kwargs for call in runner._emit_gateway_activity.call_args_list if call.kwargs.get("phase") == "cancelled"]
+    assert cancelled[0]["task_items"] == todos
