@@ -229,6 +229,48 @@ def test_relay_task_plan_metadata_populates_structured_card_items(tmp_path):
     ]
 
 
+def test_relay_lifecycle_uses_one_card_per_task_and_keeps_approval_visible(tmp_path):
+    plugin = _load_plugin()
+    manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0)
+    context = _context()
+    context.metadata["surface"] = "status_ingress"
+
+    accepted = manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "relay", "activity_id": "relay:task-one", "generation": "relay-one", "revision": 1,
+            "phase": "accepted", "status": "accepted", "summary": "Relay task accepted",
+            "metadata": {"task_plan": [{"id": "plan", "title": "Inspect Relay contract", "status": "pending"}]},
+        },
+    )
+    approval = manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "relay", "activity_id": "relay:task-one", "generation": "relay-one", "revision": 2,
+            "phase": "approval_needed", "status": "approval_needed", "summary": "Approval needed before execution",
+            "metadata": {"task_plan": [{"id": "plan", "title": "Inspect Relay contract", "status": "blocked"}]},
+        },
+    )
+    other = manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "relay", "activity_id": "relay:task-two", "generation": "relay-two", "revision": 1,
+            "phase": "working", "status": "working", "summary": "Relay task working",
+            "metadata": {"task_plan": [{"id": "plan", "title": "Collect independent evidence", "status": "in_progress"}]},
+        },
+    )
+
+    assert accepted.binding == "relay:task-one"
+    assert approval.binding == accepted.binding
+    assert approval.terminal is False
+    assert "🟡" in plugin.render_task_card(approval)
+    assert "Inspect Relay contract" in plugin.render_task_card(approval)
+    assert "task-one" not in plugin.render_task_card(approval)
+    assert other.binding == "relay:task-two"
+    assert manager.current_state(accepted.binding, accepted.topic_identity) == approval
+    assert manager.current_state(other.binding, other.topic_identity) == other
+
+
 def test_missing_source_ids_are_stable_across_snapshot_reordering():
     plugin = _load_plugin()
     first = plugin._task_items_from_snapshot(
@@ -376,6 +418,24 @@ def test_foreground_public_card_uses_todo_title_not_internal_task_id(tmp_path):
     rendered = plugin.render_task_card(state)
     assert "Check gateway health" in rendered
     assert "fg_secret" not in rendered
+
+
+def test_background_public_card_uses_first_todo_title_not_internal_task_id(tmp_path):
+    plugin = _load_plugin()
+    manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0)
+    state = manager.on_gateway_activity(
+        context=_context(),
+        activity_snapshot={
+            "kind": "background", "task_id": "bg_secret", "activity_id": "background:bg_secret",
+            "generation": "gen", "revision": 1, "phase": "background-start", "status": "running",
+            "task_items": [{"id": "one", "content": "Inspect gateway health", "status": "in_progress"}],
+        },
+    )
+
+    rendered = plugin.render_task_card(state)
+
+    assert "Inspect gateway health" in rendered
+    assert "bg_secret" not in rendered
 
 
 def test_foreground_without_todo_does_not_create_task_card(tmp_path):
@@ -1726,6 +1786,52 @@ async def test_concurrent_background_tasks_publish_to_independent_task_cards(tmp
         "taskcard:background:bg_first",
         "taskcard:background:bg_second",
     }
+
+
+@pytest.mark.asyncio
+async def test_relay_tasks_publish_independent_cards_through_approval_and_completion(tmp_path):
+    plugin = _load_plugin()
+    status = _CaptureStatus()
+    manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0)
+    context = _context(status=status)
+    context.metadata["surface"] = "status_ingress"
+
+    accepted = manager.on_gateway_activity(context=context, activity_snapshot={
+        "kind": "relay", "activity_id": "relay:task-one", "generation": "one", "revision": 1,
+        "phase": "accepted", "status": "accepted",
+        "metadata": {"task_plan": [{"id": "one", "title": "Inspect contract", "status": "pending"}]},
+    })
+    approval = manager.on_gateway_activity(context=context, activity_snapshot={
+        "kind": "relay", "activity_id": "relay:task-one", "generation": "one", "revision": 2,
+        "phase": "approval_needed", "status": "approval_needed",
+        "metadata": {"task_plan": [{"id": "one", "title": "Inspect contract", "status": "blocked"}]},
+    })
+    second = manager.on_gateway_activity(context=context, activity_snapshot={
+        "kind": "relay", "activity_id": "relay:task-two", "generation": "two", "revision": 1,
+        "phase": "working", "status": "working",
+        "metadata": {"task_plan": [{"id": "two", "title": "Collect evidence", "status": "in_progress"}]},
+    })
+    resumed = manager.on_gateway_activity(context=context, activity_snapshot={
+        "kind": "relay", "activity_id": "relay:task-one", "generation": "one", "revision": 3,
+        "phase": "working", "status": "working",
+        "metadata": {"task_plan": [{"id": "one", "title": "Inspect contract", "status": "in_progress"}]},
+    })
+    completed = manager.on_gateway_activity(context=context, activity_snapshot={
+        "kind": "relay", "activity_id": "relay:task-one", "generation": "one", "revision": 4,
+        "phase": "completed", "status": "completed", "terminal": True,
+        "metadata": {"task_plan": [{"id": "one", "title": "Inspect contract", "status": "done"}]},
+    })
+    await manager.wait_for_publishes()
+
+    assert accepted.binding == approval.binding == resumed.binding == completed.binding == "relay:task-one"
+    assert resumed.phase == "working"
+    assert completed.phase == "completed" and completed.terminal and completed.revision == 4
+    assert second.binding == "relay:task-two" and second.phase == "working"
+    assert {call["status_key"] for call in status.calls[-2:]} == {
+        "taskcard:relay:task-one", "taskcard:relay:task-two"
+    }
+    assert "task-one" not in plugin.render_task_card(completed)
+    assert "task-two" not in plugin.render_task_card(second)
 
 
 def test_global_manager_isolated_by_profile_home(tmp_path, monkeypatch):

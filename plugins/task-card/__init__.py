@@ -30,10 +30,11 @@ TERMINAL_PHASES = {
     "failed",
     "ready_for_alex",
 }
-START_PHASES = {"background-start", "foreground-start", "started"}
+START_PHASES = {"accepted", "background-start", "foreground-start", "started"}
 PHASE_RANK = {
     "queued": 0,
     "command": 1,
+    "accepted": 1,
     "background-start": 2,
     "foreground-start": 2,
     "started": 2,
@@ -41,6 +42,8 @@ PHASE_RANK = {
     "working": 3,
     "phase": 4,
     "in_progress": 4,
+    "approval": 4,
+    "approval_needed": 4,
     "drafting": 5,
     **{phase: 100 for phase in TERMINAL_PHASES},
 }
@@ -349,6 +352,8 @@ def render_task_card(state: TaskCardState) -> str:
     phase = (state.phase or "").strip().lower()
     if phase in {"completed", "ready_for_alex"}:
         marker = "✅"
+    elif phase in {"approval", "approval_needed"}:
+        marker = "🟡"
     elif phase in {"failed", "blocked"}:
         marker = "⚠️"
     elif phase in {"cancelled", "cancelled_by_user"}:
@@ -359,17 +364,22 @@ def render_task_card(state: TaskCardState) -> str:
         marker = "🔄"
     title = (
         state.items[0].label[:80]
-        if state.binding.startswith("foreground:") and state.items
+        if state.binding.startswith(("foreground:", "background:", "relay:")) and state.items
         else (
-            "Current conversation"
-            if _GENERATED_BINDING_RE.fullmatch(state.binding)
-            else state.binding
+            "Relay task"
+            if state.binding.startswith("relay:")
+            else (
+                "Current conversation"
+                if _GENERATED_BINDING_RE.fullmatch(state.binding)
+                else state.binding
+            )
         )
     )
     if state.items:
+        heading = "🟡 **Approval needed**" if phase in {"approval", "approval_needed"} else "📋 **Active task**"
         return "\n".join(
             [
-                "📋 **Active task**",
+                heading,
                 f"**{title}**",
                 "",
                 *[
@@ -462,7 +472,14 @@ def reduce_task_card_state(
                 and previous.activity_id != event.activity_id
             ):
                 return previous
-            if _phase_rank(event.phase) < _phase_rank(previous.phase) and not event.terminal:
+            if (
+                _phase_rank(event.phase) < _phase_rank(previous.phase)
+                and not event.terminal
+                and not (
+                    previous.phase in {"approval", "approval_needed"}
+                    and event.phase in {"running", "working"}
+                )
+            ):
                 return previous
             revision = event.source_revision or (previous.revision + 1)
         else:
@@ -811,7 +828,7 @@ class TaskCardManager:
             try:
                 status_key = (
                     f"taskcard:{state.binding}"
-                    if state.binding.startswith(("foreground:", "background:"))
+                    if state.binding.startswith(("foreground:", "background:", "relay:"))
                     else "taskcard"
                 )
                 result = publisher.upsert_status(
@@ -1203,6 +1220,15 @@ class TaskCardManager:
             binding = f"foreground:{task_id}"
         elif activity_kind == "background" and task_id:
             binding = f"background:{task_id}"
+        elif activity_kind == "relay" and context.metadata.get("surface") == "status_ingress":
+            relay_identity = str(activity.get("activity_id") or task_id).strip()
+            if not relay_identity:
+                return None
+            binding = (
+                relay_identity
+                if relay_identity.startswith("relay:")
+                else f"relay:{relay_identity}"
+            )
         if binding is None:
             return None
         activity_id = str(activity.get("activity_id") or "") or (
