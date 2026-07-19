@@ -239,7 +239,9 @@ class TaskCardState:
     surface: str
     platform: str | None = None
     chat_id: str | None = None
+    chat_type: str | None = None
     thread_id: str | None = None
+    scope_id: str | None = None
     session_key: str | None = None
     summary: str = ""
     updated_at: str = ""
@@ -278,7 +280,9 @@ class TaskCardState:
             surface=str(payload.get("surface") or "gateway"),
             platform=payload.get("platform") or None,
             chat_id=payload.get("chat_id") or None,
+            chat_type=payload.get("chat_type") or None,
             thread_id=payload.get("thread_id") or None,
+            scope_id=payload.get("scope_id") or None,
             session_key=payload.get("session_key") or None,
             summary=str(payload.get("summary") or ""),
             updated_at=str(payload.get("updated_at") or ""),
@@ -315,7 +319,9 @@ class TaskCardEvent:
     surface: str
     platform: str | None
     chat_id: str | None
+    chat_type: str | None
     thread_id: str | None
+    scope_id: str | None
     session_key: str | None
     summary: str
     activity_snapshot: dict[str, Any]
@@ -527,7 +533,9 @@ def reduce_task_card_state(
         surface=event.surface,
         platform=event.platform,
         chat_id=event.chat_id,
+        chat_type=event.chat_type,
         thread_id=event.thread_id,
+        scope_id=event.scope_id,
         session_key=event.session_key,
         summary=event.summary,
         updated_at=now_iso(),
@@ -1099,7 +1107,9 @@ class TaskCardManager:
             surface=str(context.metadata.get("surface") or context.origin.platform or "gateway"),
             platform=context.origin.platform,
             chat_id=context.origin.chat_id,
+            chat_type=context.origin.chat_type,
             thread_id=context.origin.thread_id,
+            scope_id=context.origin.scope_id,
             session_key=context.origin.session_key,
             summary=str(summary)[:MAX_SUMMARY_LENGTH],
             activity_snapshot=_clean(activity_snapshot or {}),

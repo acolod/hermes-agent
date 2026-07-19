@@ -745,6 +745,96 @@ class TestRunBackgroundTask:
         assert len(events) == 1
 
     @pytest.mark.asyncio
+    async def test_startup_reconciliation_terminalizes_only_abandoned_foreground_cards(
+        self, monkeypatch, tmp_path
+    ):
+        import json
+        from gateway import run as gateway_run
+
+        runner = _make_runner()
+        monkeypatch.setattr(gateway_run, "get_hermes_home", lambda: tmp_path)
+        cards_dir = tmp_path / "plugins" / "task-card" / "cards"
+        cards_dir.mkdir(parents=True)
+        records = {
+            "stale-foreground.json": {
+                "binding": "foreground:fg_stale",
+                "platform": Platform.TELEGRAM.value,
+                "chat_id": "-100",
+                "thread_id": "thread-1",
+                "session_key": "session-1",
+                "generation": "foreground-generation",
+                "revision": 4,
+                "terminal": False,
+                "items": [{"item_id": "done", "label": "Already done", "status": "complete"}],
+            },
+            "completed-foreground.json": {
+                "binding": "foreground:fg_completed",
+                "platform": Platform.TELEGRAM.value,
+                "chat_id": "chat-1",
+                "terminal": True,
+            },
+            "background.json": {
+                "binding": "background:bg_active",
+                "platform": Platform.TELEGRAM.value,
+                "chat_id": "chat-1",
+                "terminal": False,
+            },
+        }
+        for name, record in records.items():
+            (cards_dir / name).write_text(json.dumps(record), encoding="utf-8")
+
+        acknowledgement = asyncio.get_running_loop().create_future()
+        acknowledgement.set_result(True)
+        runner._emit_gateway_activity = MagicMock(return_value=acknowledgement)
+
+        await runner._reconcile_interrupted_background_tasks()
+
+        runner._emit_gateway_activity.assert_called_once()
+        event = runner._emit_gateway_activity.call_args.kwargs
+        assert event["kind"] == "foreground"
+        assert event["task_id"] == "fg_stale"
+        assert event["phase"] == event["status"] == "cancelled"
+        assert event["terminal"] is True
+        assert event["source"].chat_type == "group"
+        assert event["task_items"] == [{"id": "done", "content": "Already done", "status": "completed"}]
+        assert runner._task_card_lifecycles["foreground:fg_stale"] == {
+            "generation": "foreground-generation",
+            "revision": 4,
+        }
+
+    @pytest.mark.asyncio
+    async def test_foreground_reconciliation_preserves_an_empty_checklist(self, monkeypatch, tmp_path):
+        import json
+        from gateway import run as gateway_run
+
+        runner = _make_runner()
+        monkeypatch.setattr(gateway_run, "get_hermes_home", lambda: tmp_path)
+        cards_dir = tmp_path / "plugins" / "task-card" / "cards"
+        cards_dir.mkdir(parents=True)
+        path = cards_dir / "stale-empty.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "binding": "foreground:fg_empty",
+                    "platform": Platform.TELEGRAM.value,
+                    "chat_id": "chat-1",
+                    "generation": "foreground-generation",
+                    "revision": 2,
+                    "terminal": False,
+                    "items": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        acknowledgement = asyncio.get_running_loop().create_future()
+        acknowledgement.set_result(True)
+        runner._emit_gateway_activity = MagicMock(return_value=acknowledgement)
+
+        await runner._reconcile_interrupted_foreground_cards(tmp_path, None)
+
+        assert runner._emit_gateway_activity.call_args.kwargs["task_items"] == []
+
+    @pytest.mark.asyncio
     async def test_reconciliation_retains_false_acknowledgement_and_discards_malformed_record(
         self, monkeypatch, tmp_path
     ):

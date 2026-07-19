@@ -94,6 +94,7 @@ class PluginCommandOrigin:
     profile: Optional[str] = None
     session_key: Optional[str] = None
     chat_type: Optional[str] = None
+    scope_id: Optional[str] = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,6 +174,7 @@ def build_plugin_command_context(
     user_id: Optional[str] = None,
     profile: Optional[str] = None,
     chat_type: Optional[str] = None,
+    scope_id: Optional[str] = None,
 ) -> PluginCommandContext:
     """Build a sanitized plugin-command context from live gateway/session state."""
 
@@ -192,6 +194,8 @@ def build_plugin_command_context(
         session_key=_sanitize_origin_value(session_key),
         chat_type=_sanitize_origin_value(getattr(source, "chat_type", None) if source is not None else None)
         or _sanitize_origin_value(chat_type),
+        scope_id=_sanitize_origin_value(getattr(source, "scope_id", None) if source is not None else None)
+        or _sanitize_origin_value(scope_id),
     )
     status = None
     if adapter is not None and origin.chat_id is not None:

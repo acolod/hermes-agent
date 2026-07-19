@@ -13695,6 +13695,94 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             with _profile_runtime_scope(profile_home):
                 ledger = BackgroundTaskLedger(profile_home / "gateway")
                 await self._reconcile_background_ledger(ledger, profile_name)
+                await self._reconcile_interrupted_foreground_cards(profile_home, profile_name)
+
+    async def _reconcile_interrupted_foreground_cards(
+        self,
+        profile_home: Path,
+        profile_name: Optional[str],
+    ) -> None:
+        """Terminalize persisted foreground cards that cannot survive a restart."""
+        cards_dir = profile_home / "plugins" / "task-card" / "cards"
+        try:
+            paths = list(cards_dir.glob("*.json"))
+        except OSError:
+            return
+        await asyncio.gather(
+            *(self._reconcile_interrupted_foreground_card(path, profile_name) for path in paths)
+        )
+
+    async def _reconcile_interrupted_foreground_card(
+        self,
+        path: Path,
+        profile_name: Optional[str],
+    ) -> None:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            binding = str(payload.get("binding") or "")
+            task_id = binding.removeprefix("foreground:")
+            platform_value = payload.get("platform")
+            chat_id = payload.get("chat_id")
+            if (
+                not isinstance(payload, dict)
+                or payload.get("terminal")
+                or not binding.startswith("foreground:")
+                or not task_id.startswith("fg_")
+                or not platform_value
+                or not chat_id
+            ):
+                return
+            source = SessionSource(
+                platform=Platform(str(platform_value)),
+                chat_id=str(chat_id),
+                user_id=payload.get("user_id"),
+                chat_type=(
+                    payload.get("chat_type")
+                    or ("group" if str(platform_value) == Platform.TELEGRAM.value and str(chat_id).startswith("-") else "dm")
+                ),
+                thread_id=payload.get("thread_id"),
+                scope_id=payload.get("scope_id"),
+                profile=payload.get("profile") or profile_name,
+            )
+            if source.platform is Platform.SLACK and not source.scope_id:
+                return
+            generation = str(payload.get("generation") or "").strip()
+            revision = payload.get("revision")
+            if not generation or not isinstance(revision, int) or revision < 1:
+                return
+            items = []
+            for item in payload.get("items") or []:
+                if not isinstance(item, dict):
+                    continue
+                items.append(
+                    {
+                        "id": str(item.get("item_id") or item.get("id") or ""),
+                        "content": str(item.get("label") or item.get("content") or ""),
+                        "status": "completed"
+                        if str(item.get("status") or "").lower() in {"done", "complete", "completed"}
+                        else "failed",
+                    }
+                )
+            lifecycles = getattr(self, "_task_card_lifecycles", None)
+            if lifecycles is None:
+                lifecycles = {}
+                self._task_card_lifecycles = lifecycles
+            lifecycles[binding] = {"generation": generation, "revision": revision}
+            acknowledgement = self._emit_gateway_activity(
+                source=source,
+                session_key=payload.get("session_key") or self._session_key_for_source(source),
+                kind="foreground",
+                phase="cancelled",
+                status="cancelled",
+                summary="Foreground task interrupted by gateway refresh",
+                terminal=True,
+                task_id=task_id,
+                event_message_id=payload.get("event_message_id"),
+                task_items=items,
+            )
+            await self._await_terminal_card_publication(acknowledgement)
+        except Exception:
+            logger.warning("Foreground task-card reconciliation failed for %s", path, exc_info=True)
 
     def _background_task_ledger_for_source(self, source: SessionSource):
         from gateway.background_task_ledger import BackgroundTaskLedger
