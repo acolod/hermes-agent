@@ -85,7 +85,7 @@ class TestHandleBackgroundCommand:
     async def test_valid_prompt_starts_task(self):
         """Running /background with a prompt returns confirmation and starts task."""
         runner = _make_runner()
-        runner._emit_gateway_activity = MagicMock()
+        runner._emit_gateway_activity = MagicMock(return_value=None)
 
         # Patch asyncio.create_task to capture the coroutine
         created_tasks = []
@@ -111,6 +111,9 @@ class TestHandleBackgroundCommand:
         assert lifecycle["kind"] == "background"
         assert lifecycle["phase"] == "background-start"
         assert lifecycle["terminal"] is False
+        assert lifecycle["task_items"] == [
+            {"id": "background", "content": "Run background task", "status": "in_progress"}
+        ]
 
     @pytest.mark.asyncio
     async def test_telegram_dm_topic_passes_trigger_anchor_to_task(self):
@@ -202,7 +205,7 @@ class TestRunBackgroundTask:
     async def test_no_adapter_returns_silently(self):
         """When no adapter is available, the task returns without error."""
         runner = _make_runner()
-        runner._emit_gateway_activity = MagicMock()
+        runner._emit_gateway_activity = MagicMock(return_value=None)
         source = SessionSource(
             platform=Platform.TELEGRAM,
             user_id="12345",
@@ -243,7 +246,7 @@ class TestRunBackgroundTask:
     async def test_no_credentials_send_failure_emits_one_terminal_event(self):
         """A failed error delivery must not duplicate the lifecycle terminal."""
         runner = _make_runner()
-        runner._emit_gateway_activity = MagicMock()
+        runner._emit_gateway_activity = MagicMock(return_value=None)
         mock_adapter = AsyncMock()
         mock_adapter.send = AsyncMock(side_effect=RuntimeError("offline"))
         runner.adapters[Platform.TELEGRAM] = mock_adapter
@@ -266,7 +269,7 @@ class TestRunBackgroundTask:
     async def test_successful_task_sends_result(self):
         """When the agent completes successfully, the result is sent."""
         runner = _make_runner()
-        runner._emit_gateway_activity = MagicMock()
+        runner._emit_gateway_activity = MagicMock(return_value=None)
         mock_adapter = AsyncMock()
         mock_adapter.send = AsyncMock()
         mock_adapter.extract_media = MagicMock(return_value=([], "Hello from background!"))
@@ -306,10 +309,138 @@ class TestRunBackgroundTask:
         assert lifecycle["terminal"] is True
 
     @pytest.mark.asyncio
+    async def test_successful_task_settles_terminal_card_before_result_delivery(self):
+        runner = _make_runner()
+        acknowledgement = asyncio.get_running_loop().create_future()
+        acknowledgement.set_result(True)
+        runner._emit_gateway_activity = MagicMock(return_value=acknowledgement)
+        delivery_order: list[str] = []
+
+        async def _await_card(_ack):
+            delivery_order.append("card")
+
+        runner._await_terminal_card_publication = AsyncMock(side_effect=_await_card)
+        mock_adapter = AsyncMock()
+        mock_adapter.send = AsyncMock(side_effect=lambda *_args, **_kwargs: delivery_order.append("result"))
+        mock_adapter.extract_media = MagicMock(return_value=([], "done"))
+        mock_adapter.extract_images = MagicMock(return_value=([], "done"))
+        runner.adapters[Platform.TELEGRAM] = mock_adapter
+        source = SessionSource(platform=Platform.TELEGRAM, user_id="12345", chat_id="67890")
+
+        with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "test-key"}), \
+             patch("run_agent.AIAgent") as MockAgent:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "done", "messages": []}
+            MockAgent.return_value = mock_agent
+            await runner._run_background_task("say hello", source, "bg_test")
+
+        runner._await_terminal_card_publication.assert_awaited_once()
+        assert delivery_order == ["card", "result"]
+
+    @pytest.mark.asyncio
+    async def test_background_todo_step_updates_working_card_and_terminal_snapshot(self):
+        runner = _make_runner()
+        runner._emit_gateway_activity = MagicMock(return_value=None)
+        mock_adapter = AsyncMock()
+        mock_adapter.send = AsyncMock()
+        mock_adapter.extract_media = MagicMock(return_value=([], "done"))
+        mock_adapter.extract_images = MagicMock(return_value=([], "done"))
+        runner.adapters[Platform.TELEGRAM] = mock_adapter
+        source = SessionSource(platform=Platform.TELEGRAM, user_id="12345", chat_id="67890")
+        todos = [{"id": "inspect", "content": "Inspect current state", "status": "in_progress"}]
+
+        with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "test-key"}), \
+             patch("run_agent.AIAgent") as MockAgent:
+            mock_agent = MagicMock()
+            mock_agent._todo_store.read.return_value = todos
+
+            def _run_conversation(**_kwargs):
+                MockAgent.call_args.kwargs["step_callback"](
+                    1,
+                    [{"name": "todo", "result": {"todos": todos}}],
+                )
+                return {"final_response": "done", "messages": []}
+
+            mock_agent.run_conversation.side_effect = _run_conversation
+            MockAgent.return_value = mock_agent
+            await runner._run_background_task("say hello", source, "bg_test")
+
+        activities = [call.kwargs for call in runner._emit_gateway_activity.call_args_list]
+        working = next(activity for activity in activities if activity["phase"] == "working")
+        terminal = next(activity for activity in activities if activity["terminal"])
+        assert working["task_items"] == todos
+        assert terminal["task_items"] == todos
+
+    @pytest.mark.asyncio
+    async def test_cancelled_background_task_carries_latest_todo_snapshot(self):
+        runner = _make_runner()
+        runner._emit_gateway_activity = MagicMock(return_value=None)
+        mock_adapter = AsyncMock()
+        mock_adapter.send = AsyncMock()
+        runner.adapters[Platform.TELEGRAM] = mock_adapter
+        source = SessionSource(platform=Platform.TELEGRAM, user_id="12345", chat_id="67890")
+        todos = [{"id": "inspect", "content": "Inspect current state", "status": "in_progress"}]
+
+        with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "test-key"}), \
+             patch("run_agent.AIAgent") as MockAgent:
+            mock_agent = MagicMock()
+
+            def _run_conversation(**_kwargs):
+                MockAgent.call_args.kwargs["step_callback"](
+                    1,
+                    [{"name": "todo", "result": {"todos": todos}}],
+                )
+                raise asyncio.CancelledError
+
+            mock_agent.run_conversation.side_effect = _run_conversation
+            MockAgent.return_value = mock_agent
+            with pytest.raises(asyncio.CancelledError):
+                await runner._run_background_task("say hello", source, "bg_test")
+
+        terminal = next(
+            call.kwargs
+            for call in runner._emit_gateway_activity.call_args_list
+            if call.kwargs["phase"] == "cancelled"
+        )
+        assert terminal["task_items"] == todos
+
+    @pytest.mark.asyncio
+    async def test_failed_background_task_carries_latest_todo_snapshot(self):
+        runner = _make_runner()
+        runner._emit_gateway_activity = MagicMock(return_value=None)
+        mock_adapter = AsyncMock()
+        mock_adapter.send = AsyncMock()
+        runner.adapters[Platform.TELEGRAM] = mock_adapter
+        source = SessionSource(platform=Platform.TELEGRAM, user_id="12345", chat_id="67890")
+        todos = [{"id": "inspect", "content": "Inspect current state", "status": "in_progress"}]
+
+        with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "test-key"}), \
+             patch("run_agent.AIAgent") as MockAgent:
+            mock_agent = MagicMock()
+
+            def _run_conversation(**_kwargs):
+                MockAgent.call_args.kwargs["step_callback"](
+                    1,
+                    [{"name": "todo", "result": {"todos": todos}}],
+                )
+                raise RuntimeError("boom")
+
+            mock_agent.run_conversation.side_effect = _run_conversation
+            MockAgent.return_value = mock_agent
+            await runner._run_background_task("say hello", source, "bg_test")
+
+        terminal = next(
+            call.kwargs
+            for call in runner._emit_gateway_activity.call_args_list
+            if call.kwargs["phase"] == "failed"
+        )
+        assert terminal["task_items"] == todos
+
+    @pytest.mark.asyncio
     async def test_unsuccessful_result_emits_failed_lifecycle(self):
         """A returned failure must not be represented as a completed task card."""
         runner = _make_runner()
-        runner._emit_gateway_activity = MagicMock()
+        runner._emit_gateway_activity = MagicMock(return_value=None)
         mock_adapter = AsyncMock()
         mock_adapter.send = AsyncMock()
         mock_adapter.extract_media = MagicMock(return_value=([], "Error: failed"))
@@ -344,7 +475,7 @@ class TestRunBackgroundTask:
     @pytest.mark.asyncio
     async def test_cancelled_task_emits_background_cancellation(self):
         runner = _make_runner()
-        runner._emit_gateway_activity = MagicMock()
+        runner._emit_gateway_activity = MagicMock(return_value=None)
         adapter = AsyncMock()
         adapter.send = AsyncMock()
         runner.adapters[Platform.TELEGRAM] = adapter

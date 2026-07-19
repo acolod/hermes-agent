@@ -2664,6 +2664,13 @@ class GatewaySlashCommandsMixin:
             terminal=False,
             task_id=task_id,
             event_message_id=getattr(event, "message_id", None),
+            task_items=[
+                {
+                    "id": "background",
+                    "content": "Run background task",
+                    "status": "in_progress",
+                }
+            ],
         )
 
         preview = prompt[:60] + ("..." if len(prompt) > 60 else "")

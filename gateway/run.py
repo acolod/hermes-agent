@@ -13710,6 +13710,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
 
         _thread_metadata = self._thread_metadata_for_source(source, event_message_id)
+        current_run_todo_items: list[Optional[list[dict[str, Any]]]] = [None]
+        terminal_activity_emitted = False
+        gateway_loop = asyncio.get_running_loop()
+
+        def _emit_background_todo_update(todos: list[dict[str, Any]]) -> None:
+            self._emit_gateway_activity(
+                source=source,
+                session_key=self._session_key_for_source(source),
+                kind="background",
+                phase="working",
+                status="running",
+                summary="Background task checklist updated",
+                terminal=False,
+                task_id=task_id,
+                event_message_id=event_message_id,
+                task_items=todos,
+            )
+
+        def _background_step_callback_sync(_iteration: int, previous_tools: list) -> None:
+            for tool in previous_tools or []:
+                if not isinstance(tool, dict) or tool.get("name") != "todo":
+                    continue
+                try:
+                    raw_result = tool.get("result")
+                    if isinstance(raw_result, str):
+                        try:
+                            parsed = json.loads(raw_result)
+                        except json.JSONDecodeError:
+                            parsed, _ = json.JSONDecoder().raw_decode(raw_result.lstrip())
+                    else:
+                        parsed = raw_result
+                    todos = parsed.get("todos") if isinstance(parsed, dict) else None
+                    if isinstance(todos, list):
+                        current_run_todo_items[0] = list(todos)
+                        gateway_loop.call_soon_threadsafe(_emit_background_todo_update, list(todos))
+                except Exception:
+                    logger.debug("Background Todo callback parsing failed", exc_info=True)
+                return
 
         try:
             user_config = _load_gateway_config()
@@ -13718,12 +13756,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 user_config=user_config,
             )
             if not runtime_kwargs.get("api_key"):
-                await adapter.send(
-                    source.chat_id,
-                    f"❌ Background task {task_id} failed: no provider credentials configured.",
-                    metadata=_thread_metadata,
-                )
-                self._emit_gateway_activity(
+                publication_ack = self._emit_gateway_activity(
                     source=source,
                     session_key=self._session_key_for_source(source),
                     kind="background",
@@ -13733,6 +13766,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     terminal=True,
                     task_id=task_id,
                     event_message_id=event_message_id,
+                )
+                terminal_activity_emitted = True
+                await self._await_terminal_card_publication(publication_ack)
+                await adapter.send(
+                    source.chat_id,
+                    f"❌ Background task {task_id} failed: no provider credentials configured.",
+                    metadata=_thread_metadata,
                 )
                 return
 
@@ -13788,6 +13828,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     provider_require_parameters=pr.get("require_parameters", False),
                     provider_data_collection=pr.get("data_collection"),
                     session_id=task_id,
+                    step_callback=_background_step_callback_sync,
                     platform=platform_key,
                     user_id=source.user_id,
                     user_id_alt=source.user_id_alt,
@@ -13809,6 +13850,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         result = dict(result)
                         items = getattr(agent, "_todo_store", None)
                         items = items.read() if items is not None else []
+                        if current_run_todo_items[0] is not None:
+                            items = current_run_todo_items[0]
                         result["task_items"] = items
                         result["task_items_observed"] = bool(items)
                     return result
@@ -13820,6 +13863,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             response = normalize_visible_text(result.get("final_response", "")) if isinstance(result, dict) else ""
             if not response and result and result.get("error"):
                 response = f"Error: {result['error']}"
+
+            background_failed = bool(
+                isinstance(result, dict)
+                and (
+                    result.get("failed")
+                    or (result.get("error") and not result.get("completed"))
+                )
+            )
+            publication_ack = self._emit_gateway_activity(
+                source=source,
+                session_key=self._session_key_for_source(source),
+                kind="background",
+                phase="failed" if background_failed else "completed",
+                status="failed" if background_failed else "completed",
+                summary=(
+                    "Background task failed"
+                    if background_failed
+                    else "Background task completed"
+                ),
+                terminal=True,
+                task_id=task_id,
+                event_message_id=event_message_id,
+                task_items=(result.get("task_items") if isinstance(result, dict) and result.get("task_items_observed") else None),
+            )
+            terminal_activity_emitted = True
+            await self._await_terminal_card_publication(publication_ack)
 
             # Extract media files from the response
             if response:
@@ -13901,32 +13970,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     metadata=_thread_metadata,
                 )
 
-            background_failed = bool(
-                isinstance(result, dict)
-                and (
-                    result.get("failed")
-                    or (result.get("error") and not result.get("completed"))
-                )
-            )
-            self._emit_gateway_activity(
-                source=source,
-                session_key=self._session_key_for_source(source),
-                kind="background",
-                phase="failed" if background_failed else "completed",
-                status="failed" if background_failed else "completed",
-                summary=(
-                    "Background task failed"
-                    if background_failed
-                    else "Background task completed"
-                ),
-                terminal=True,
-                task_id=task_id,
-                event_message_id=event_message_id,
-                task_items=(result.get("task_items") if isinstance(result, dict) and result.get("task_items_observed") else None),
-            )
-
         except asyncio.CancelledError:
-            self._emit_gateway_activity(
+            publication_ack = self._emit_gateway_activity(
                 source=source,
                 session_key=self._session_key_for_source(source),
                 kind="background",
@@ -13936,11 +13981,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 terminal=True,
                 task_id=task_id,
                 event_message_id=event_message_id,
+                task_items=current_run_todo_items[0],
             )
+            await self._await_terminal_card_publication(publication_ack)
             raise
         except Exception as e:
+            if terminal_activity_emitted:
+                logger.exception("Background task %s result delivery failed", task_id)
+                return
             logger.exception("Background task %s failed", task_id)
-            self._emit_gateway_activity(
+            publication_ack = self._emit_gateway_activity(
                 source=source,
                 session_key=self._session_key_for_source(source),
                 kind="background",
@@ -13950,7 +14000,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 terminal=True,
                 task_id=task_id,
                 event_message_id=event_message_id,
+                task_items=current_run_todo_items[0],
             )
+            await self._await_terminal_card_publication(publication_ack)
             try:
                 await adapter.send(
                     chat_id=source.chat_id,
@@ -17537,7 +17589,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 )
             publication_ack = None
-            if terminal and kind == "foreground":
+            if terminal and kind in {"foreground", "background"}:
                 publication_ack = asyncio.get_running_loop().create_future()
             context = build_plugin_command_context(
                 command="gateway_activity",

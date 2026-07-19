@@ -811,7 +811,7 @@ class TaskCardManager:
             try:
                 status_key = (
                     f"taskcard:{state.binding}"
-                    if state.binding.startswith("foreground:")
+                    if state.binding.startswith(("foreground:", "background:"))
                     else "taskcard"
                 )
                 result = publisher.upsert_status(
@@ -1201,6 +1201,8 @@ class TaskCardManager:
             if "task_items" not in activity:
                 return None
             binding = f"foreground:{task_id}"
+        elif activity_kind == "background" and task_id:
+            binding = f"background:{task_id}"
         if binding is None:
             return None
         activity_id = str(activity.get("activity_id") or "") or (

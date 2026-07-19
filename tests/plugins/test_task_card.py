@@ -1667,7 +1667,7 @@ def test_unrelated_activity_cannot_terminal_lock_active_background_card(tmp_path
         },
         terminal=True,
     )
-    after_unrelated = manager.current_state("release-card")
+    after_unrelated = manager.current_state("background:bg-1", background.topic_identity)
     completed = manager.on_gateway_activity(
         context=context,
         activity_snapshot={
@@ -1683,6 +1683,49 @@ def test_unrelated_activity_cannot_terminal_lock_active_background_card(tmp_path
     assert background.activity_id == "background:bg-1"
     assert after_unrelated == background
     assert completed is not None and completed.terminal is True
+
+
+@pytest.mark.asyncio
+async def test_concurrent_background_tasks_publish_to_independent_task_cards(tmp_path):
+    plugin = _load_plugin()
+    status = _CaptureStatus()
+    manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0)
+    context = _context(status=status)
+    manager.handle_command("bind release-card", context)
+    await manager.wait_for_publishes()
+
+    first = manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "background",
+            "task_id": "bg_first",
+            "phase": "background-start",
+            "status": "running",
+            "summary": "Background task accepted",
+            "task_items": [{"id": "background", "content": "Run background task", "status": "in_progress"}],
+        },
+    )
+    second = manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "background",
+            "task_id": "bg_second",
+            "phase": "background-start",
+            "status": "running",
+            "summary": "Background task accepted",
+            "task_items": [{"id": "background", "content": "Run background task", "status": "in_progress"}],
+        },
+    )
+    await manager.wait_for_publishes()
+
+    assert first.binding == "background:bg_first"
+    assert second.binding == "background:bg_second"
+    assert manager.current_state("background:bg_first", first.topic_identity).binding == "background:bg_first"
+    assert manager.current_state("background:bg_second", second.topic_identity).binding == "background:bg_second"
+    assert {call["status_key"] for call in status.calls[-2:]} == {
+        "taskcard:background:bg_first",
+        "taskcard:background:bg_second",
+    }
 
 
 def test_global_manager_isolated_by_profile_home(tmp_path, monkeypatch):
