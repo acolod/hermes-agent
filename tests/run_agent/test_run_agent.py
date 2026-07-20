@@ -4287,6 +4287,58 @@ class TestRunConversation:
         assert '"id": "current"' in observed[-1][0]["result"]
         assert '"id": "old"' not in observed[-1][0]["result"]
 
+    def test_todo_observer_runs_without_step_callback(self, agent):
+        self._setup_agent(agent)
+        agent.valid_tool_names.add("todo")
+        agent.tool_definitions = [
+            {"type": "function", "function": {"name": "todo", "description": "test", "parameters": {"type": "object"}}}
+        ]
+        todo = _mock_tool_call(name="todo", arguments='{"todos":[{"id":"current","content":"current","status":"pending"}]}', call_id="current-todo")
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response(content="", finish_reason="tool_calls", tool_calls=[todo]),
+            _mock_response(content="Done", finish_reason="stop"),
+        ]
+        observed = []
+        with (
+            patch("run_agent.handle_function_call", return_value='{"todos":[{"id":"current"}]}'),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            agent.run_conversation(
+                "[current group prompt]",
+                iteration_observer=lambda _messages, tools: observed.append(tools),
+            )
+        assert observed[-1][0]["name"] == "todo"
+
+    def test_todo_observer_receives_final_tool_batch_without_next_iteration(self, agent):
+        self._setup_agent(agent)
+        agent.max_iterations = 1
+        agent.valid_tool_names.add("todo")
+        agent.tool_definitions = [
+            {"type": "function", "function": {"name": "todo", "description": "test", "parameters": {"type": "object"}}}
+        ]
+        todo = _mock_tool_call(name="todo", arguments='{"todos":[{"id":"final","content":"final","status":"pending"}]}', call_id="final-todo")
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="", finish_reason="tool_calls", tool_calls=[todo]
+        )
+        observed = []
+        stepped = []
+        agent.step_callback = lambda _iteration, tools: stepped.append(tools)
+        with (
+            patch("run_agent.handle_function_call", return_value='{"todos":[{"id":"final"}]}'),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            agent.run_conversation(
+                "[final tool batch prompt]",
+                iteration_observer=lambda _messages, tools: observed.append(tools),
+            )
+        assert len(observed) == 1
+        assert observed[0][0]["name"] == "todo"
+        assert stepped == [[]]
+
     def test_tool_call_none_args_verbose_logging_does_not_crash(self, agent):
         self._setup_agent(agent)
         agent.verbose_logging = True

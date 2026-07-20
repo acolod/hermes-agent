@@ -703,8 +703,10 @@ def run_conversation(
                 agent._safe_print(f"\n⚠️  Iteration budget exhausted ({agent.iteration_budget.used}/{agent.iteration_budget.max_total} iterations used)")
             break
 
-        # Fire step_callback for gateway hooks (agent:step event)
-        if agent.step_callback is not None:
+        # Observe completed tool batches before the next API call. Observers are
+        # intentionally independent from visible step callbacks so automation
+        # callers can consume bounded state without enabling UI progress hooks.
+        if agent.step_callback is not None or iteration_observer is not None:
             try:
                 prev_tools = getattr(agent, "_last_completed_tool_batch", None)
                 agent._last_completed_tool_batch = None
@@ -713,11 +715,15 @@ def run_conversation(
                         messages,
                         int(getattr(agent, "_task_card_turn_start_index", 0)),
                     )
-                if iteration_observer is not None:
+                if iteration_observer is not None and prev_tools:
                     iteration_observer(messages, prev_tools)
-                agent.step_callback(api_call_count, prev_tools)
             except Exception as _step_err:
-                logger.debug("step_callback error (iteration %s): %s", api_call_count, _step_err)
+                logger.debug("iteration observer error (iteration %s): %s", api_call_count, _step_err)
+            if agent.step_callback is not None:
+                try:
+                    agent.step_callback(api_call_count, prev_tools)
+                except Exception as _step_err:
+                    logger.debug("step_callback error (iteration %s): %s", api_call_count, _step_err)
 
         # Track tool-calling iterations for skill nudge.
         # Counter resets whenever skill_manage is actually used.
@@ -5559,6 +5565,20 @@ def run_conversation(
                 messages.append({"role": "assistant", "content": final_response})
                 break
     
+    # A tool batch normally reaches the observer at the beginning of the next
+    # iteration. If this turn ends immediately after tool execution (for
+    # example, an iteration-budget exit), drain that pending batch once here.
+    # Deliberately do not fire step_callback: this is finalization, not a new
+    # visible progress step.
+    if iteration_observer is not None:
+        try:
+            pending_tools = getattr(agent, "_last_completed_tool_batch", None)
+            if pending_tools is not None:
+                agent._last_completed_tool_batch = None
+                iteration_observer(messages, pending_tools)
+        except Exception as _observer_err:
+            logger.debug("final iteration observer error: %s", _observer_err)
+
     # Post-loop turn finalization extracted to agent/turn_finalizer.finalize_turn
     # (god-file decomposition Phase 1 step 4). Behavior-neutral: the assembled
     # result dict is returned exactly as before.

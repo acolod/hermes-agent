@@ -3676,6 +3676,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         checkpoints: bool = False,
         pass_session_id: bool = False,
         ignore_rules: bool = False,
+        todo_snapshot_path: str | None = None,
     ):
         """
         Initialize the Hermes CLI.
@@ -3694,6 +3695,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         """
         # Initialize Rich console
         self.console = Console()
+        self.todo_snapshot_observer = None
+        if todo_snapshot_path:
+            from hermes_cli.todo_snapshot import TodoSnapshotWriter
+
+            self.todo_snapshot_observer = TodoSnapshotWriter(todo_snapshot_path).observe
         self.config = CLI_CONFIG
         self.compact = compact if compact is not None else CLI_CONFIG["display"].get("compact", False)
         # tool_progress: "off", "new", "all", "verbose" (from config.yaml display section)
@@ -12495,14 +12501,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     message if (_voice_prefix or agent_message != message) else None
                 )
                 try:
-                    result = self.agent.run_conversation(
-                        user_message=agent_message,
-                        conversation_history=self.conversation_history[:-1],  # Exclude the message we just added
-                        stream_callback=stream_callback,
-                        task_id=self.session_id,
-                        persist_user_message=_persist_clean_user_message,
-                        moa_config=_moa_cfg,
-                    )
+                    conversation_kwargs = {
+                        "user_message": agent_message,
+                        "conversation_history": self.conversation_history[:-1],  # Exclude the message we just added
+                        "stream_callback": stream_callback,
+                        "task_id": self.session_id,
+                        "persist_user_message": _persist_clean_user_message,
+                        "moa_config": _moa_cfg,
+                    }
+                    if self.todo_snapshot_observer is not None:
+                        conversation_kwargs["iteration_observer"] = self.todo_snapshot_observer
+                    result = self.agent.run_conversation(**conversation_kwargs)
                     if getattr(self, "_pending_moa_disable_after_turn", False):
                         _restore = getattr(self, "_pending_moa_restore_model", None) or {}
                         for _key, _value in _restore.items():
@@ -15984,6 +15993,7 @@ def main(
     pass_session_id: bool = False,
     ignore_user_config: bool = False,
     ignore_rules: bool = False,
+    todo_snapshot_path: str | None = None,
 ):
     """
     Hermes Agent CLI - Interactive AI Assistant
@@ -16119,6 +16129,7 @@ def main(
         checkpoints=checkpoints,
         pass_session_id=pass_session_id,
         ignore_rules=ignore_rules,
+        todo_snapshot_path=todo_snapshot_path,
     )
 
     if parsed_skills:
@@ -16365,10 +16376,14 @@ def main(
                         cli.agent.stream_delta_callback = None
                         cli.agent.tool_gen_callback = None
                         try:
-                            result = cli.agent.run_conversation(
-                                user_message=effective_query,
-                                conversation_history=cli.conversation_history,
-                            )
+                            conversation_kwargs = {
+                                "user_message": effective_query,
+                                "conversation_history": cli.conversation_history,
+                            }
+                            todo_snapshot_observer = getattr(cli, "todo_snapshot_observer", None)
+                            if todo_snapshot_observer is not None:
+                                conversation_kwargs["iteration_observer"] = todo_snapshot_observer
+                            result = cli.agent.run_conversation(**conversation_kwargs)
                         except KeyboardInterrupt:
                             _emit_interrupted_session_end(cli, reason="keyboard_interrupt")
                             print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
