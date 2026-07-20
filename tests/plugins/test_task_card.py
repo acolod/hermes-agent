@@ -191,7 +191,7 @@ def test_structured_kimi_todos_render_as_bounded_claude_style_checklist(tmp_path
     assert plugin.render_task_card(state) == (
         "📋 **Active task**\n"
         "**Improve checklist**\n\n"
-        "- ✅ Inspect existing state\n"
+        "- ✅ ~~Inspect existing state~~\n"
         "- ▶️ Implement item model\n"
         "- ⬜ Run focused tests\n"
         "- ⚠️ Await external input\n"
@@ -269,6 +269,218 @@ def test_relay_lifecycle_uses_one_card_per_task_and_keeps_approval_visible(tmp_p
     assert other.binding == "relay:task-two"
     assert manager.current_state(accepted.binding, accepted.topic_identity) == approval
     assert manager.current_state(other.binding, other.topic_identity) == other
+
+
+def test_relay_without_todos_renders_full_completed_lifecycle_and_details(tmp_path):
+    plugin = _load_plugin()
+    manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0)
+    context = _context()
+    context.metadata["surface"] = "status_ingress"
+    common = {
+        "kind": "relay",
+        "activity_id": "relay:no-todos",
+        "generation": "no-todos",
+        "metadata": {
+            "relay_title": "No-Todo Relay lifecycle",
+            "next_action": "Await follow-up.",
+        },
+    }
+    for revision, phase in enumerate(("started", "picked_up", "working"), start=1):
+        manager.on_gateway_activity(
+            context=context,
+            activity_snapshot={
+                **common,
+                "revision": revision,
+                "phase": phase,
+                "status": "running",
+                "summary": phase,
+            },
+        )
+    completed = manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            **common,
+            "revision": 4,
+            "phase": "completed",
+            "status": "completed",
+            "terminal": True,
+            "summary": "Lifecycle completed safely.",
+        },
+    )
+
+    rendered = plugin.render_task_card(completed)
+
+    assert completed.items == ()
+    assert "✅ **Completed**" in rendered
+    assert "**No-Todo Relay lifecycle**" in rendered
+    assert "- ✅ Received" in rendered
+    assert "- ✅ Picked up" in rendered
+    assert "- ✅ Working" in rendered
+    assert "- ✅ Completed" in rendered
+    assert "**Duration:**" in rendered
+    assert "**Result:** Lifecycle completed safely." in rendered
+    assert "**Next:** Await follow-up." in rendered
+
+
+def test_relay_active_working_row_uses_in_progress_marker_without_todos(tmp_path):
+    plugin = _load_plugin()
+    manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0)
+    context = _context()
+    context.metadata["surface"] = "status_ingress"
+    common = {"kind": "relay", "activity_id": "relay:active", "generation": "active"}
+    state = None
+    for revision, phase in enumerate(("started", "picked_up", "working"), start=1):
+        state = manager.on_gateway_activity(
+            context=context,
+            activity_snapshot={
+                **common,
+                "revision": revision,
+                "phase": phase,
+                "status": "running",
+            },
+        )
+
+    assert state is not None
+    rendered = plugin.render_task_card(state)
+
+    assert "- ✅ Received" in rendered
+    assert "- ✅ Picked up" in rendered
+    assert "- 🔄 Working" in rendered
+    assert "- ⬜ Awaiting outcome" in rendered
+
+
+def test_relay_approval_before_working_keeps_working_row_pending(tmp_path):
+    plugin = _load_plugin()
+    manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0)
+    context = _context()
+    context.metadata["surface"] = "status_ingress"
+    common = {"kind": "relay", "activity_id": "relay:approval-before-working", "generation": "approval-before-working"}
+    manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={**common, "revision": 1, "phase": "accepted", "status": "accepted"},
+    )
+    approval = manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={**common, "revision": 2, "phase": "approval_needed", "status": "approval_needed"},
+    )
+
+    rendered = plugin.render_task_card(approval)
+
+    assert "working" not in approval.lifecycle_milestones
+    assert "- ⬜ Working" in rendered
+    assert "- 🟡 Approval needed" in rendered
+
+
+def test_terminal_relay_without_working_milestone_keeps_working_row_pending(tmp_path):
+    plugin = _load_plugin()
+    manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0)
+    context = _context()
+    context.metadata["surface"] = "status_ingress"
+    common = {"kind": "relay", "activity_id": "relay:terminal-before-working", "generation": "terminal-before-working"}
+    for revision, phase in enumerate(("started", "picked_up"), start=1):
+        manager.on_gateway_activity(
+            context=context,
+            activity_snapshot={**common, "revision": revision, "phase": phase, "status": "running"},
+        )
+    terminal = manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={**common, "revision": 3, "phase": "failed", "status": "failed", "terminal": True},
+    )
+
+    rendered = plugin.render_task_card(terminal)
+
+    assert "working" not in terminal.lifecycle_milestones
+    assert "- ⬜ Working" in rendered
+    assert "- ❌ Failed" in rendered
+
+
+@pytest.mark.parametrize(
+    ("phase", "terminal", "heading", "outcome"),
+    [
+        ("completed", True, "✅ **Completed**", "✅ Completed"),
+        ("failed", True, "❌ **Failed**", "❌ Failed"),
+        ("blocked", True, "⚠️ **Blocked**", "⚠️ Blocked"),
+        ("cancelled", True, "⛔ **Cancelled**", "⛔ Cancelled"),
+        ("approval_needed", False, "🟡 **Approval needed**", "🟡 Approval needed"),
+    ],
+)
+def test_relay_outcome_row_and_heading_follow_lifecycle_phase(
+    tmp_path,
+    phase,
+    terminal,
+    heading,
+    outcome,
+):
+    plugin = _load_plugin()
+    manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0)
+    context = _context()
+    context.metadata["surface"] = "status_ingress"
+    common = {"kind": "relay", "activity_id": f"relay:{phase}", "generation": phase}
+    for revision, previous_phase in enumerate(("started", "picked_up"), start=1):
+        manager.on_gateway_activity(
+            context=context,
+            activity_snapshot={
+                **common,
+                "revision": revision,
+                "phase": previous_phase,
+                "status": "running",
+            },
+        )
+    state = manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            **common,
+            "revision": 3,
+            "phase": phase,
+            "status": phase,
+            "terminal": terminal,
+        },
+    )
+
+    rendered = plugin.render_task_card(state)
+
+    assert heading in rendered
+    assert f"- {outcome}" in rendered
+    assert "- ⬜ Working" in rendered
+
+
+def test_terminal_relay_card_persists_timestamped_milestones_and_terminal_fields(tmp_path):
+    plugin = _load_plugin()
+    manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0)
+    context = _context()
+    context.metadata["surface"] = "status_ingress"
+    common = {"kind": "relay", "activity_id": "relay:merge", "generation": "merge-1"}
+    for revision, phase in enumerate(("started", "picked_up", "working"), start=1):
+        manager.on_gateway_activity(
+            context=context,
+            activity_snapshot={**common, "revision": revision, "phase": phase, "status": "running", "summary": phase},
+        )
+    terminal = manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            **common,
+            "revision": 4,
+            "phase": "completed",
+            "status": "completed",
+            "terminal": True,
+            "summary": "Merged safely.",
+            "task_items": [{"id": "merge", "content": "Merge lifecycle cards", "status": "completed"}],
+            "metadata": {"relay_title": "Task Card lifecycle merge", "next_action": "Await follow-up."},
+        },
+    )
+
+    rendered = plugin.render_task_card(terminal)
+
+    assert set(terminal.lifecycle_milestones) == {"received", "picked_up", "working", "terminal"}
+    assert "**Task Card lifecycle merge**" in rendered
+    assert "- ✅ ~~Merge lifecycle cards~~" in rendered
+    assert "- ✅ Received" in rendered
+    assert "- ✅ Picked up" in rendered
+    assert "- ✅ Working" in rendered
+    assert "- ✅ Completed" in rendered
+    assert "Merged safely." in rendered
+    assert "**Duration:**" in rendered
+    assert "Await follow-up." in rendered
 
 
 def test_missing_source_ids_are_stable_across_snapshot_reordering():

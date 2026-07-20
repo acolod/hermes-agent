@@ -38,13 +38,14 @@ PHASE_RANK = {
     "background-start": 2,
     "foreground-start": 2,
     "started": 2,
-    "running": 3,
-    "working": 3,
-    "phase": 4,
-    "in_progress": 4,
-    "approval": 4,
-    "approval_needed": 4,
-    "drafting": 5,
+    "picked_up": 3,
+    "running": 4,
+    "working": 4,
+    "phase": 5,
+    "in_progress": 5,
+    "approval": 5,
+    "approval_needed": 5,
+    "drafting": 6,
     **{phase: 100 for phase in TERMINAL_PHASES},
 }
 SHOW_COMMANDS = {"", "show", "status", "view", "render", "refresh"}
@@ -249,6 +250,7 @@ class TaskCardState:
     metadata: dict[str, Any] | None = None
     retired_generations: list[str] | None = None
     items: tuple[TaskCardItem, ...] = ()
+    lifecycle_milestones: dict[str, str] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return _clean(asdict(self))
@@ -302,6 +304,11 @@ class TaskCardState:
                 for item in list(payload.get("items") or [])
                 if isinstance(item, dict) and str(item.get("item_id") or item.get("id") or "").strip() and str(item.get("label") or "").strip()
             )[:MAX_TASK_ITEMS],
+            lifecycle_milestones={
+                key: str(value)
+                for key, value in dict(payload.get("lifecycle_milestones") or {}).items()
+                if key in {"received", "picked_up", "working", "terminal"} and str(value).strip()
+            },
         )
 
 
@@ -349,6 +356,8 @@ class TaskCardEvent:
                 "session_key": self.session_key,
                 "summary": self.summary,
                 "items": [asdict(item) for item in self.items or ()],
+                "relay_title": str(self.metadata.get("relay_title") or "") if self.metadata else "",
+                "next_action": str(self.metadata.get("next_action") or "") if self.metadata else "",
             }
         )
 
@@ -356,6 +365,7 @@ class TaskCardEvent:
 def render_task_card(state: TaskCardState) -> str:
     """Render the user-facing card without routing or persistence internals."""
     phase = (state.phase or "").strip().lower()
+    is_relay = state.binding.startswith("relay:")
     if phase in {"completed", "ready_for_alex"}:
         marker = "✅"
     elif phase in {"approval", "approval_needed"}:
@@ -368,32 +378,73 @@ def render_task_card(state: TaskCardState) -> str:
         marker = "⏳"
     else:
         marker = "🔄"
+    metadata = dict(state.metadata or {})
+    milestones = dict(state.lifecycle_milestones or {})
     title = (
-        state.items[0].label[:80]
-        if state.binding.startswith(("foreground:", "background:", "relay:")) and state.items
+        str(metadata.get("relay_title") or "").strip()[:MAX_LABEL_LENGTH]
+        if is_relay and str(metadata.get("relay_title") or "").strip()
         else (
-            "Relay task"
-            if state.binding.startswith("relay:")
+            state.items[0].label[:80]
+            if state.binding.startswith(("foreground:", "background:", "relay:")) and state.items
             else (
-                "Current conversation"
-                if _GENERATED_BINDING_RE.fullmatch(state.binding)
-                else state.binding
+                "Relay task"
+                if is_relay
+                else (
+                    "Current conversation"
+                    if _GENERATED_BINDING_RE.fullmatch(state.binding)
+                    else state.binding
+                )
             )
         )
     )
-    if state.items:
-        heading = "🟡 **Approval needed**" if phase in {"approval", "approval_needed"} else "📋 **Active task**"
-        return "\n".join(
-            [
-                heading,
-                f"**{title}**",
-                "",
-                *[
-                    f"- {_TASK_ITEM_MARKERS[item.status]} {item.label}"
-                    for item in state.items
-                ],
-            ]
+    if is_relay or state.items:
+        heading = {
+            "completed": "✅ **Completed**", "ready_for_alex": "✅ **Completed**",
+            "failed": "❌ **Failed**", "blocked": "⚠️ **Blocked**",
+            "cancelled": "⛔ **Cancelled**", "cancelled_by_user": "⛔ **Cancelled**",
+            "approval": "🟡 **Approval needed**", "approval_needed": "🟡 **Approval needed**",
+        }.get(phase, "📋 **Active task**")
+        lines = [heading, f"**{title}**", ""]
+        if is_relay:
+            working_active = phase in {"running", "working", "phase", "in_progress", "drafting"}
+            working_complete = bool(milestones.get("working"))
+            lines.extend(
+                [
+                    f"- {'✅' if milestones.get('received') else '⬜'} Received",
+                    f"- {'✅' if milestones.get('picked_up') else '⬜'} Picked up",
+                    f"- {'🔄' if working_active else '✅' if working_complete else '⬜'} Working",
+                ]
+            )
+            outcome_label = (
+                "Approval needed"
+                if phase in {"approval", "approval_needed"}
+                else {
+                "completed": "Completed", "ready_for_alex": "Completed", "failed": "Failed",
+                "blocked": "Blocked", "cancelled": "Cancelled", "cancelled_by_user": "Cancelled",
+                }.get(phase, "Awaiting outcome")
+            )
+            outcome_marker = {
+                "completed": "✅", "ready_for_alex": "✅", "failed": "❌", "blocked": "⚠️",
+                "cancelled": "⛔", "cancelled_by_user": "⛔", "approval": "🟡", "approval_needed": "🟡",
+            }.get(phase, "⬜")
+            lines.extend([f"- {outcome_marker} {outcome_label}", ""])
+        lines.extend(
+            f"- {_TASK_ITEM_MARKERS[item.status]} {'~~' + item.label + '~~' if item.status == 'complete' else item.label}"
+            for item in state.items
         )
+        if is_relay and milestones.get("terminal"):
+            started = next((milestones.get(key) for key in ("received", "picked_up", "working") if milestones.get(key)), None)
+            if started:
+                try:
+                    seconds = max(0, int((datetime.fromisoformat(milestones["terminal"]) - datetime.fromisoformat(started)).total_seconds()))
+                    lines.append(f"**Duration:** {seconds}s")
+                except ValueError:
+                    pass
+            if state.summary:
+                lines.append(f"**{'Result' if phase in {'completed', 'ready_for_alex'} else 'What happened'}:** {state.summary}")
+        if is_relay and (milestones.get("terminal") or phase in {"approval", "approval_needed"}) and metadata.get("next_action"):
+            lines.append(f"**Next:** {metadata['next_action']}")
+        return "\n".join(lines)
     checklist_item = (state.summary or state.status or state.phase or state.binding).strip()
     diagnostic_values = (
         state.topic_identity,
@@ -514,6 +565,17 @@ def reduce_task_card_state(
     elif previous is not None and same_generation:
         items = _merge_task_items(previous.items, items)
 
+    milestones = dict(previous.lifecycle_milestones or {}) if previous is not None and same_generation else {}
+    if event.activity_kind == "relay":
+        accepted_at = now_iso()
+        milestone = ({"started": "received", "accepted": "received", "picked_up": "picked_up"}.get(event.phase)
+            or ("working" if event.phase in {"running", "working", "phase", "in_progress", "drafting"} else None)
+            or ("terminal" if event.phase in TERMINAL_PHASES else None))
+        if milestone:
+            milestones.setdefault(milestone, accepted_at)
+    merged_metadata = {**dict(previous.metadata or {}), **event.metadata} if previous else dict(event.metadata)
+    if previous is not None and same_generation and previous.metadata and previous.metadata.get("relay_title"):
+        merged_metadata["relay_title"] = previous.metadata["relay_title"]
     state = TaskCardState(
         binding=event.binding,
         topic_identity=event.topic_identity,
@@ -540,9 +602,10 @@ def reduce_task_card_state(
         summary=event.summary,
         updated_at=now_iso(),
         activity_snapshot=event.activity_snapshot,
-        metadata={**dict(previous.metadata or {}), **event.metadata} if previous else event.metadata,
+        metadata=merged_metadata,
         retired_generations=retired_generations,
         items=items,
+        lifecycle_milestones=milestones,
     )
     return _with_content_hash(state)
 
@@ -1115,9 +1178,12 @@ class TaskCardManager:
             activity_snapshot=_clean(activity_snapshot or {}),
             metadata=_clean(
                 {
-                    key: value
-                    for key, value in dict(context.metadata or {}).items()
-                    if not str(key).startswith("_")
+                    **{
+                        key: value
+                        for key, value in dict(context.metadata or {}).items()
+                        if not str(key).startswith("_")
+                    },
+                    **dict((activity_snapshot or {}).get("metadata") or {}),
                 }
             ),
             items=_task_items_from_snapshot(activity_snapshot or {}),
