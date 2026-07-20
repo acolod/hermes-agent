@@ -17920,6 +17920,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "terminal": terminal,
             "metadata": dict(event.get("metadata") or {}),
         }
+        if "task_items" in event:
+            snapshot["task_items"] = list(event["task_items"])
         context = build_plugin_command_context(
             command="gateway_activity",
             raw_args="",

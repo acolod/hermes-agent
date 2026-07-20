@@ -1,3 +1,7 @@
+import importlib.util
+import sys
+import uuid
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -7,6 +11,7 @@ from gateway.config import Platform
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
 from gateway.status_ingress import OriginRoute
+from hermes_cli.plugins import PluginCommandContext, PluginCommandOrigin
 
 
 def _source():
@@ -30,6 +35,24 @@ def _event():
         "summary": "Relay completed",
         "metadata": {"relay_path": "task"},
     }
+
+
+def _task_items():
+    return [
+        {"id": "inspect", "content": "Inspect the ingress", "status": "completed"},
+        {"id": "forward", "content": "Forward the snapshot", "status": "in_progress"},
+    ]
+
+
+def _load_task_card_plugin():
+    path = Path(__file__).resolve().parents[2] / "plugins" / "task-card" / "__init__.py"
+    name = f"task_card_status_ingress_test_{uuid.uuid4().hex}"
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def test_internal_gateway_activity_registers_opaque_origin_handle_in_context_metadata():
@@ -119,6 +142,69 @@ async def test_external_status_event_resolves_gateway_route_and_invokes_existing
         "metadata": {"relay_path": "task"},
     }
     assert invoke.call_args.kwargs["terminal"] is True
+
+
+@pytest.mark.asyncio
+async def test_external_status_event_forwards_task_snapshot_for_terminal_task_card_retention(tmp_path):
+    plugin = _load_task_card_plugin()
+    manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path))
+    runner = object.__new__(GatewayRunner)
+    runner._adapter_for_source = MagicMock(return_value=None)
+    route = OriginRoute(
+        platform="telegram",
+        chat_id="-100123",
+        thread_id="9",
+        session_key="session-1",
+    )
+    binding_context = PluginCommandContext(
+        command="taskcard",
+        raw_args="",
+        origin=PluginCommandOrigin(
+            platform="telegram",
+            chat_id="-100123",
+            thread_id="9",
+            session_key="session-1",
+        ),
+        metadata={"surface": "status_ingress"},
+    )
+    manager.handle_command("bind Relay", binding_context)
+    states = []
+
+    def accept(*_args, **kwargs):
+        context = kwargs["context"]
+        acknowledgement = context.metadata.pop("_status_ingress_ack")
+        try:
+            state = manager.on_gateway_activity(
+                context=context,
+                activity_snapshot=kwargs["activity_snapshot"],
+                terminal=kwargs["terminal"],
+            )
+        finally:
+            context.metadata["_status_ingress_ack"] = acknowledgement
+        states.append(state)
+        if not acknowledgement.done():
+            acknowledgement.set_result(state is not None)
+        return [state] if state is not None else []
+
+    with patch("hermes_cli.plugins.invoke_hook", side_effect=accept):
+        await runner._handle_status_ingress_event(
+            route,
+            {
+                **_event(),
+                "revision": 1,
+                "phase": "started",
+                "status": "running",
+                "task_items": _task_items(),
+            },
+        )
+        await runner._handle_status_ingress_event(route, _event())
+
+    assert [(item.item_id, item.status) for item in states[0].items] == [
+        ("inspect", "complete"),
+        ("forward", "active"),
+    ]
+    assert states[1].terminal is True
+    assert states[1].items == states[0].items
 
 
 @pytest.mark.asyncio

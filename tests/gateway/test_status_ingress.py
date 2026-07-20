@@ -111,6 +111,37 @@ def test_status_event_requires_bounded_monotonic_identity_and_metadata():
         validate_status_event(_event(activity_id="x" * 129))
 
 
+def test_status_event_accepts_a_bounded_full_task_snapshot_and_preserves_omission():
+    task_items = [
+        {"id": "inspect", "content": "Inspect the ingress", "status": "completed"},
+        {"id": "forward", "content": "Forward the snapshot", "status": "in_progress"},
+    ]
+
+    supplied = validate_status_event(_event(task_items=task_items))
+    omitted = validate_status_event(_event())
+
+    assert supplied["task_items"] == task_items
+    assert "task_items" not in omitted
+
+
+@pytest.mark.parametrize(
+    "task_items",
+    [
+        [],
+        [{"id": "duplicate", "content": "One", "status": "pending"}, {"id": "duplicate", "content": "Two", "status": "completed"}],
+        [{"id": "one", "content": "One", "status": "unknown"}],
+        [{"id": "one", "content": "One", "status": " pending "}],
+        [{"id": "one", "content": "One", "status": "pending", "extra": True}],
+        [{"id": "x" * 129, "content": "One", "status": "pending"}],
+        [{"id": "one", "content": "x" * 161, "status": "pending"}],
+        [{"id": "one", "content": "One", "status": "pending"}] * 17,
+    ],
+)
+def test_status_event_rejects_malformed_task_snapshots(task_items):
+    with pytest.raises(ValueError, match="task_items|id|content"):
+        validate_status_event(_event(task_items=task_items))
+
+
 async def _request(socket_path: Path, payload: dict) -> dict:
     reader, writer = await asyncio.open_unix_connection(str(socket_path))
     writer.write(json.dumps(payload).encode("utf-8") + b"\n")

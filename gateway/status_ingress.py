@@ -30,6 +30,10 @@ MAX_PHASE_LENGTH = 64
 MAX_STATUS_LENGTH = 64
 MAX_SUMMARY_LENGTH = 256
 MAX_ORIGINS = 256
+MAX_TASK_ITEMS = 16
+MAX_TASK_ITEM_CONTENT_LENGTH = 160
+_TASK_ITEM_FIELDS = frozenset({"id", "content", "status"})
+_TASK_ITEM_STATUSES = frozenset({"pending", "in_progress", "completed", "cancelled"})
 
 _EVENT_FIELDS = frozenset(
     {
@@ -41,6 +45,7 @@ _EVENT_FIELDS = frozenset(
         "status",
         "summary",
         "metadata",
+        "task_items",
     }
 )
 _REQUEST_FIELDS = frozenset({"token", "origin_handle", "operation", "event"})
@@ -234,6 +239,31 @@ def _validate_metadata_value(value: Any, *, depth: int) -> None:
     raise ValueError("metadata contains an unsupported value")
 
 
+def _validate_task_items(value: Any) -> list[dict[str, str]]:
+    if not isinstance(value, list) or not value or len(value) > MAX_TASK_ITEMS:
+        raise ValueError("task_items must be a nonempty bounded list")
+    items: list[dict[str, str]] = []
+    seen_ids: set[str] = set()
+    for item in value:
+        if not isinstance(item, dict) or set(item) != _TASK_ITEM_FIELDS:
+            raise ValueError("task_items rows must contain id, content, and status")
+        item_id = _bounded_text(item, "id", MAX_ID_LENGTH)
+        if item_id in seen_ids:
+            raise ValueError("task_items ids must be unique")
+        status = item.get("status")
+        if not isinstance(status, str) or status not in _TASK_ITEM_STATUSES:
+            raise ValueError("task_items status is invalid")
+        items.append(
+            {
+                "id": item_id,
+                "content": _bounded_text(item, "content", MAX_TASK_ITEM_CONTENT_LENGTH),
+                "status": status,
+            }
+        )
+        seen_ids.add(item_id)
+    return items
+
+
 def validate_status_event(raw: Any) -> dict[str, Any]:
     """Validate the complete caller-controlled lifecycle envelope."""
 
@@ -245,7 +275,7 @@ def validate_status_event(raw: Any) -> dict[str, Any]:
     revision = raw.get("revision")
     if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
         raise ValueError("revision must be a positive integer")
-    return {
+    event = {
         "activity_kind": _bounded_text(raw, "activity_kind", 64),
         "activity_id": _bounded_text(raw, "activity_id", MAX_ID_LENGTH),
         "generation": _bounded_text(raw, "generation", MAX_ID_LENGTH),
@@ -255,6 +285,9 @@ def validate_status_event(raw: Any) -> dict[str, Any]:
         "summary": _bounded_text(raw, "summary", MAX_SUMMARY_LENGTH, required=False),
         "metadata": _validate_metadata(raw.get("metadata")),
     }
+    if "task_items" in raw:
+        event["task_items"] = _validate_task_items(raw["task_items"])
+    return event
 
 
 def event_is_terminal(event: dict[str, Any]) -> bool:
