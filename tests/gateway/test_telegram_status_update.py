@@ -296,6 +296,102 @@ async def test_edit_message_validates_returned_message(
 
 
 @pytest.mark.asyncio
+async def test_markdown_v2_task_card_edit_validates_rendered_visible_text(adapter):
+    """Task-card MarkdownV2 edits validate the text Telegram visibly returns."""
+    from plugins.platforms.telegram.adapter import (
+        TelegramAdapter,
+        _canonical_mdv2_visible_text,
+    )
+
+    content = (
+        "✅ COMPLETED\n\n"
+        "✅ 1. ~~*Task name*~~\n"
+        "── OUTCOME ──\n"
+        "Result: *Fixed*.\n"
+        "Next: review (today)!"
+    )
+    rendered_text = (
+        "✅ COMPLETED\n\n"
+        "✅ 1. Task name\n"
+        "── OUTCOME ──\n"
+        "Result: Fixed.\n"
+        "Next: review (today)!"
+    )
+    adapter.edit_message = TelegramAdapter.edit_message.__get__(adapter, TelegramAdapter)
+    adapter._bot.edit_message_text = AsyncMock(
+        return_value=SimpleNamespace(
+            chat=SimpleNamespace(id=-5141963563),
+            message_id=15438,
+            text=rendered_text,
+        )
+    )
+
+    result = await adapter.edit_message(
+        "-5141963563",
+        "15438",
+        content,
+        finalize=True,
+        metadata={"validate_edit_response": True},
+    )
+
+    assert result.success is True
+    assert result.raw_response["reason"] == "validated"
+    assert adapter._bot.edit_message_text.call_args.kwargs["text"] != content
+    assert adapter._bot.edit_message_text.call_args.kwargs["parse_mode"] == "MarkdownV2"
+    literal_source = r"Result: *Fixed*\."
+    assert _canonical_mdv2_visible_text(adapter.format_message(literal_source)) == r"Result: Fixed\."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("returned_text", "success"),
+    [
+        ("Result: received then working", True),
+        ("Result: picked_up then working", False),
+        ("Result: received then blocked", False),
+    ],
+)
+async def test_markdown_v2_edit_validates_visible_inline_code_and_link_label(
+    adapter,
+    returned_text,
+    success,
+):
+    """Inline code and links compare against the visible Telegram text only."""
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    adapter.edit_message = TelegramAdapter.edit_message.__get__(adapter, TelegramAdapter)
+    adapter._bot.edit_message_text = AsyncMock(
+        return_value=SimpleNamespace(
+            chat=SimpleNamespace(id=-5141963563),
+            message_id=15438,
+            text=returned_text,
+        )
+    )
+
+    result = await adapter.edit_message(
+        "-5141963563",
+        "15438",
+        "Result: `received` then [working](https://example.test/status)",
+        finalize=True,
+        metadata={"validate_edit_response": True},
+    )
+
+    assert result.success is success
+    assert result.raw_response["reason"] == ("validated" if success else "text_mismatch")
+
+
+def test_markdown_v2_canonicalizer_preserves_fenced_code_body_linebreaks(adapter):
+    """Fenced-code delimiters and language headers are not visible Telegram text."""
+    from plugins.platforms.telegram.adapter import _canonical_mdv2_visible_text
+
+    source = "Result:\n```text\nreceived\npicked_up\nworking\n```"
+
+    assert _canonical_mdv2_visible_text(adapter.format_message(source)) == (
+        "Result:\nreceived\npicked_up\nworking"
+    )
+
+
+@pytest.mark.asyncio
 async def test_unverified_edit_does_not_create_replacement(adapter):
     """A response mismatch must preserve the binding instead of sending anew."""
     adapter.edit_message.return_value = SendResult(
@@ -340,6 +436,44 @@ async def test_normal_markdown_edit_does_not_require_task_card_validation(adapte
 
     assert result.success is True
     assert result.raw_response is None
+
+
+@pytest.mark.asyncio
+async def test_status_update_acknowledges_normalized_todo_edit_in_place(adapter):
+    """A Todo edit falls back exactly and succeeds instead of dispatch_failed."""
+    from plugins.platforms.telegram.adapter import TelegramAdapter, _strip_mdv2
+
+    content = "✅ 1. ~~*Task name*~~\n── OUTCOME ──\nResult: Fixed."
+    plain = _strip_mdv2(content)
+    adapter.edit_message = TelegramAdapter.edit_message.__get__(adapter, TelegramAdapter)
+    adapter._status_message_ids[("-5141963563", "taskcard")] = "15438"
+    adapter._bot.edit_message_text = AsyncMock(
+        side_effect=[
+            Exception("MarkdownV2 parse failed"),
+            SimpleNamespace(
+                chat=SimpleNamespace(id=-5141963563),
+                message_id=15438,
+                text=plain,
+            ),
+        ]
+    )
+
+    result = await adapter.send_or_update_status(
+        "-5141963563",
+        "taskcard",
+        content,
+        metadata={"validate_edit_response": True, "preserve_status_message_id": True},
+    )
+
+    assert result.success is True
+    assert result.message_id == "15438"
+    assert result.error_kind is None
+    adapter.send.assert_not_awaited()
+    assert adapter._bot.edit_message_text.await_args_list[-1].kwargs == {
+        "chat_id": -5141963563,
+        "message_id": 15438,
+        "text": plain,
+    }
 
 
 @pytest.mark.asyncio

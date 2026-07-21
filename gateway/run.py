@@ -6070,7 +6070,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
 
     async def _finalize_shutdown_agents(self, active_agents: Dict[str, Any]) -> None:
-        for agent in active_agents.values():
+        for session_key, agent in active_agents.items():
             # Persist any in-flight transcript to the SQLite session store
             # before teardown (#13121).  An agent forcibly interrupted by the
             # drain-timeout escalation may never reach
@@ -6110,6 +6110,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _invoke_hook(
                     "on_session_finalize",
                     session_id=getattr(agent, "session_id", None),
+                    session_key=session_key,
                     platform="gateway",
                     reason="shutdown",
                 )
@@ -7845,6 +7846,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _invoke_hook(
                                 "on_session_finalize",
                                 session_id=entry.session_id,
+                                session_key=key,
                                 platform=_platform,
                                 reason="session_expired",
                             )

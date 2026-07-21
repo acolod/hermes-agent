@@ -383,6 +383,45 @@ def _strip_mdv2(text: str) -> str:
     return cleaned
 
 
+def _canonical_mdv2_visible_text(formatted: str) -> str:
+    """Return the visible text Telegram produces from an exact MarkdownV2 payload."""
+    protected: dict[str, str] = {}
+
+    def stash(value: str) -> str:
+        token = f"\x00MDV2_VISIBLE_{len(protected)}\x00"
+        protected[token] = value
+        return token
+
+    def decode_code_escapes(value: str) -> str:
+        return re.sub(r"\\([\\`])", r"\1", value)
+
+    def replace_fence(match: re.Match[str]) -> str:
+        body = match.group("body")
+        if body.endswith("\n"):
+            body = body[:-1]
+        return stash(decode_code_escapes(body))
+
+    text = re.sub(
+        r"```[^\n]*\n(?P<body>[\s\S]*?)```",
+        replace_fence,
+        formatted,
+    )
+    text = re.sub(
+        r"`(?P<body>(?:\\[\\`]|[^`])*)`",
+        lambda match: stash(decode_code_escapes(match.group("body"))),
+        text,
+    )
+    text = re.sub(
+        r"\[(?P<label>(?:\\.|[^\]])*)\]\((?:\\.|[^)])*\)",
+        lambda match: match.group("label"),
+        text,
+    )
+    visible = _strip_mdv2(text)
+    for token, value in protected.items():
+        visible = visible.replace(token, value)
+    return visible
+
+
 _CHUNK_INDICATOR_ON_FENCE_RE = re.compile(
     r'(?m)^``` (?P<indicator>(?:\\)?\(\d+/\d+(?:\\)?\))$'
 )
@@ -4447,7 +4486,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         edit_response,
                         chat_id=chat_id,
                         message_id=message_id,
-                        expected_text=content,
+                        expected_text=_canonical_mdv2_visible_text(formatted),
                     )
                 return SendResult(success=True, message_id=message_id)
             except Exception as fmt_err:

@@ -30,7 +30,7 @@ TERMINAL_PHASES = {
     "failed",
     "ready_for_alex",
 }
-START_PHASES = {"accepted", "background-start", "foreground-start", "started"}
+START_PHASES = {"accepted", "background-start", "foreground-start", "received", "started"}
 PHASE_RANK = {
     "queued": 0,
     "command": 1,
@@ -38,7 +38,9 @@ PHASE_RANK = {
     "background-start": 2,
     "foreground-start": 2,
     "started": 2,
+    "received": 2,
     "picked_up": 3,
+    "picked-up": 3,
     "running": 4,
     "working": 4,
     "phase": 5,
@@ -56,6 +58,7 @@ MAX_SUMMARY_LENGTH = 256
 MAX_TASK_ITEMS = 16
 MAX_TASK_ITEM_ID_LENGTH = 128
 MAX_TASK_ITEM_LABEL_LENGTH = 160
+MAX_HEARTBEAT_CONTENT_UTF16_UNITS = 1_600
 _TASK_ITEM_MARKERS = {
     "pending": "⬜",
     "active": "▶️",
@@ -90,6 +93,21 @@ _GENERATED_BINDING_RE = re.compile(r"task-[0-9a-f]{12}\Z")
 _DIAGNOSTIC_FIELD_RE = re.compile(
     r"\b(?:route|revision|rev|hash|content_hash|revision_hash|generation|chat_id|thread_id|session(?:_key)?|topic_identity|activity(?:_id)?)\s*[:=]",
     re.IGNORECASE,
+)
+_SUCCESS_TERMINAL_CONTRADICTION_RE = re.compile(
+    r"""^(?:
+        stopped\s+(?:on\s+(?:verification\s+)?mismatch|because\s+of\s+verification\s+mismatch|due\s+to\s+verification\s+mismatch)\b
+        |blocked(?:\s*[.!?]\s*$|\s+(?:by|because|on|pending|waiting|until)\b)
+        |failed(?:\s*[.!?]\s*$|\s+(?:to|because|on|with|at)\b)
+        |failure(?:\s*[.!?]\s*$|\s+(?:during|because|on|with|at)\b)
+        |cancel(?:led|ed)(?:\s*[.!?]\s*$|\s+(?:by|because|due\s+to|on)\b)
+        |unable\s+to\b
+        |could\s+not\b
+        |did\s+not\b
+        |no\s+terminal\s+completion\b
+        |verification\s+mismatch\b
+    )""",
+    re.IGNORECASE | re.VERBOSE,
 )
 _USE_STATE_REVISION = object()
 
@@ -214,12 +232,21 @@ def _merge_task_items(
     previous: tuple[TaskCardItem, ...],
     incoming: tuple[TaskCardItem, ...],
 ) -> tuple[TaskCardItem, ...]:
-    """Keep completed work complete when a late source snapshot regresses it."""
-    completed = {item.item_id for item in previous if item.status == "complete"}
-    return tuple(
-        replace(item, status="complete") if item.item_id in completed else item
-        for item in incoming
+    """Overlay by ID without losing first-seen order or omitted work."""
+    updates = {item.item_id: item for item in incoming}
+    merged: list[TaskCardItem] = []
+    seen: set[str] = set()
+    for old in previous:
+        new = updates.get(old.item_id, old)
+        if old.status == "complete":
+            new = replace(new, status="complete")
+        merged.append(new)
+        seen.add(old.item_id)
+    merged.extend(
+        item for item in incoming
+        if item.item_id not in seen and len(merged) < MAX_TASK_ITEMS
     )
+    return tuple(merged)
 
 
 @dataclass(frozen=True)
@@ -246,6 +273,7 @@ class TaskCardState:
     session_key: str | None = None
     summary: str = ""
     updated_at: str = ""
+    generation_started_at: str = ""
     activity_snapshot: dict[str, Any] | None = None
     metadata: dict[str, Any] | None = None
     retired_generations: list[str] | None = None
@@ -288,6 +316,11 @@ class TaskCardState:
             session_key=payload.get("session_key") or None,
             summary=str(payload.get("summary") or ""),
             updated_at=str(payload.get("updated_at") or ""),
+            generation_started_at=str(
+                payload.get("generation_started_at")
+                or payload.get("updated_at")
+                or ""
+            ),
             activity_snapshot=dict(payload.get("activity_snapshot") or {}),
             metadata=dict(payload.get("metadata") or {}),
             retired_generations=[
@@ -357,15 +390,176 @@ class TaskCardEvent:
                 "summary": self.summary,
                 "items": [asdict(item) for item in self.items or ()],
                 "relay_title": str(self.metadata.get("relay_title") or "") if self.metadata else "",
+                "automatic_title": str(
+                    (self.metadata or {}).get("title")
+                    or (self.metadata or {}).get("activity_title")
+                    or self.activity_snapshot.get("title")
+                    or ""
+                ),
                 "next_action": str(self.metadata.get("next_action") or "") if self.metadata else "",
             }
         )
+
+
+def _format_duration(seconds: int | float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes = seconds // 60
+    if minutes < 60:
+        remainder = seconds % 60
+        return f"{minutes}m" + (f" {remainder}s" if remainder else "")
+    hours, remainder = divmod(minutes, 60)
+    return f"{hours}h" + (f" {remainder}m" if remainder else "")
+
+
+def _seconds_between(started_at: str, ended_at: str) -> int:
+    try:
+        return max(
+            0,
+            int(
+                (
+                    datetime.fromisoformat(ended_at)
+                    - datetime.fromisoformat(started_at)
+                ).total_seconds()
+            ),
+        )
+    except (TypeError, ValueError):
+        return 0
+
+
+def _concise_result(state: TaskCardState) -> str:
+    result = re.split(r"\s+Next\s*:\s*", state.summary.strip(), maxsplit=1, flags=re.IGNORECASE)[0]
+    result = result.splitlines()[0].strip() if result else ""
+    result = re.split(r"(?<=[.!?])\s+", result, maxsplit=1)[0]
+    if (
+        state.terminal
+        and state.phase == "completed"
+        and str((state.metadata or {}).get("state_key") or "").strip().lower() == "done"
+        and _SUCCESS_TERMINAL_CONTRADICTION_RE.match(result)
+    ):
+        return "Task completed successfully."
+    if _DIAGNOSTIC_FIELD_RE.search(result):
+        result = "Task completed." if state.phase in {"completed", "ready_for_alex"} else "Task ended."
+    return result or {
+        "completed": "Task completed.",
+        "ready_for_alex": "Task completed.",
+        "blocked": "Task is blocked.",
+        "failed": "Task failed.",
+        "cancelled": "Task was cancelled.",
+        "cancelled_by_user": "Task was cancelled.",
+    }.get(state.phase, "Task ended.")
+
+
+def _automatic_activity_title(state: TaskCardState) -> str:
+    metadata = dict(state.metadata or {})
+    supplied = (
+        metadata.get("relay_title")
+        if state.binding.startswith("relay:")
+        else (
+            metadata.get("title")
+            or metadata.get("activity_title")
+            or dict(state.activity_snapshot or {}).get("title")
+        )
+    )
+    supplied = str(supplied or "").strip()
+    if supplied:
+        return supplied[:MAX_LABEL_LENGTH]
+    if state.items:
+        return state.items[0].label
+    return "Relay task" if state.binding.startswith("relay:") else "Current activity"
+
+
+def _render_automatic_task_card(state: TaskCardState) -> str:
+    phase = (state.phase or "").strip().lower()
+    milestones = dict(state.lifecycle_milestones or {})
+    heading = {
+        "accepted": "📬 RECEIVED",
+        "started": "📬 RECEIVED",
+        "received": "📬 RECEIVED",
+        "picked_up": "👀 PICKED UP",
+        "picked-up": "👀 PICKED UP",
+        "approval": "🟡 APPROVAL NEEDED",
+        "approval_needed": "🟡 APPROVAL NEEDED",
+        "blocked": "⚠️ BLOCKED",
+        "failed": "❌ FAILED",
+        "cancelled": "⛔ CANCELLED",
+        "cancelled_by_user": "⛔ CANCELLED",
+        "completed": "✅ COMPLETED",
+        "ready_for_alex": "✅ COMPLETED",
+    }.get(phase, "🔄 WORKING")
+    successful = phase in {"completed", "ready_for_alex"}
+    working_active = phase in {"running", "working", "phase", "in_progress", "drafting"} or (
+        state.binding.startswith(("foreground:", "background:"))
+        and phase in {"foreground-start", "background-start", "started"}
+    )
+    progress = (
+        ("✅", "✅", "✅", "✅")
+        if successful
+        else (
+            ("✅" if milestones.get("received") else "⬜"),
+            ("✅" if milestones.get("picked_up") else "⬜"),
+            ("🔄" if working_active else "✅" if milestones.get("working") else "⬜"),
+            "⬜",
+        )
+    )
+    task_lines = []
+    for number, item in enumerate(state.items, start=1):
+        label = item.label
+        if item.status == "complete":
+            label = f"~~*{label}*~~"
+        task_lines.append(f"{_TASK_ITEM_MARKERS[item.status]} {number}. {label}")
+    lines = [
+        heading,
+        _automatic_activity_title(state),
+        "",
+        "── PROGRESS ──",
+        f"{progress[0]} Received",
+        f"{progress[1]} Picked up",
+        f"{progress[2]} Working",
+        f"{progress[3]} Completed",
+        "",
+        "── TASK LIST ──",
+        *task_lines,
+        "",
+    ]
+    if state.terminal:
+        terminal_at = milestones.get("terminal") or state.updated_at or now_iso()
+        duration = _format_duration(_seconds_between(state.generation_started_at, terminal_at))
+        next_action = str((state.metadata or {}).get("next_action") or "").strip()
+        next_action = re.sub(r"^Next\s*:\s*", "", next_action, flags=re.IGNORECASE)
+        if not next_action:
+            next_action = "No action needed." if successful or phase.startswith("cancel") else "Review the task and decide the next step."
+        lines.extend(
+            [
+                "── OUTCOME ──",
+                f"Duration: {duration}",
+                f"Result: {_concise_result(state)}",
+                f"Next: {next_action}",
+            ]
+        )
+    elif phase in {"approval", "approval_needed"}:
+        lines.extend(["── STATUS ──", "🟡 Approval needed"])
+    else:
+        elapsed = _format_duration(
+            _seconds_between(state.generation_started_at, now_iso())
+        )
+        lines.extend(["── STATUS ──", f"⏱ Running · {elapsed}"])
+    return "\n".join(lines)
+
+
+def _fits_heartbeat_message(content: str) -> bool:
+    """Leave room for Telegram MarkdownV2 escaping and astral emoji units."""
+    return len(content.encode("utf-16-le")) // 2 <= MAX_HEARTBEAT_CONTENT_UTF16_UNITS
 
 
 def render_task_card(state: TaskCardState) -> str:
     """Render the user-facing card without routing or persistence internals."""
     phase = (state.phase or "").strip().lower()
     is_relay = state.binding.startswith("relay:")
+    is_automatic = state.binding.startswith(("relay:", "foreground:", "background:"))
+    if is_relay or (is_automatic and state.items):
+        return _render_automatic_task_card(state)
     if phase in {"completed", "ready_for_alex"}:
         marker = "✅"
     elif phase in {"approval", "approval_needed"}:
@@ -397,7 +591,7 @@ def render_task_card(state: TaskCardState) -> str:
             )
         )
     )
-    if is_relay or state.items:
+    if state.items:
         heading = {
             "completed": "✅ **Completed**", "ready_for_alex": "✅ **Completed**",
             "failed": "❌ **Failed**", "blocked": "⚠️ **Blocked**",
@@ -405,45 +599,10 @@ def render_task_card(state: TaskCardState) -> str:
             "approval": "🟡 **Approval needed**", "approval_needed": "🟡 **Approval needed**",
         }.get(phase, "📋 **Active task**")
         lines = [heading, f"**{title}**", ""]
-        if is_relay:
-            working_active = phase in {"running", "working", "phase", "in_progress", "drafting"}
-            working_complete = bool(milestones.get("working"))
-            lines.extend(
-                [
-                    f"- {'✅' if milestones.get('received') else '⬜'} Received",
-                    f"- {'✅' if milestones.get('picked_up') else '⬜'} Picked up",
-                    f"- {'🔄' if working_active else '✅' if working_complete else '⬜'} Working",
-                ]
-            )
-            outcome_label = (
-                "Approval needed"
-                if phase in {"approval", "approval_needed"}
-                else {
-                "completed": "Completed", "ready_for_alex": "Completed", "failed": "Failed",
-                "blocked": "Blocked", "cancelled": "Cancelled", "cancelled_by_user": "Cancelled",
-                }.get(phase, "Awaiting outcome")
-            )
-            outcome_marker = {
-                "completed": "✅", "ready_for_alex": "✅", "failed": "❌", "blocked": "⚠️",
-                "cancelled": "⛔", "cancelled_by_user": "⛔", "approval": "🟡", "approval_needed": "🟡",
-            }.get(phase, "⬜")
-            lines.extend([f"- {outcome_marker} {outcome_label}", ""])
         lines.extend(
             f"- {_TASK_ITEM_MARKERS[item.status]} {'~~' + item.label + '~~' if item.status == 'complete' else item.label}"
             for item in state.items
         )
-        if is_relay and milestones.get("terminal"):
-            started = next((milestones.get(key) for key in ("received", "picked_up", "working") if milestones.get(key)), None)
-            if started:
-                try:
-                    seconds = max(0, int((datetime.fromisoformat(milestones["terminal"]) - datetime.fromisoformat(started)).total_seconds()))
-                    lines.append(f"**Duration:** {seconds}s")
-                except ValueError:
-                    pass
-            if state.summary:
-                lines.append(f"**{'Result' if phase in {'completed', 'ready_for_alex'} else 'What happened'}:** {state.summary}")
-        if is_relay and (milestones.get("terminal") or phase in {"approval", "approval_needed"}) and metadata.get("next_action"):
-            lines.append(f"**Next:** {metadata['next_action']}")
         return "\n".join(lines)
     checklist_item = (state.summary or state.status or state.phase or state.binding).strip()
     diagnostic_values = (
@@ -565,14 +724,34 @@ def reduce_task_card_state(
     elif previous is not None and same_generation:
         items = _merge_task_items(previous.items, items)
 
+    event_time = now_iso()
+    generation_started_at = (
+        previous.generation_started_at
+        if previous is not None and same_generation and previous.generation_started_at
+        else event_time
+    )
     milestones = dict(previous.lifecycle_milestones or {}) if previous is not None and same_generation else {}
     if event.activity_kind == "relay":
-        accepted_at = now_iso()
-        milestone = ({"started": "received", "accepted": "received", "picked_up": "picked_up"}.get(event.phase)
+        milestone = ({
+            "started": "received", "accepted": "received", "received": "received",
+            "picked_up": "picked_up", "picked-up": "picked_up",
+        }.get(event.phase)
             or ("working" if event.phase in {"running", "working", "phase", "in_progress", "drafting"} else None)
             or ("terminal" if event.phase in TERMINAL_PHASES else None))
         if milestone:
-            milestones.setdefault(milestone, accepted_at)
+            milestones.setdefault(milestone, event_time)
+    elif event.binding.startswith(("foreground:", "background:")) and items:
+        if event.terminal:
+            for milestone in ("received", "picked_up", "working", "terminal"):
+                milestones.setdefault(milestone, event_time)
+        else:
+            milestones.setdefault("received", event_time)
+            milestones.setdefault("picked_up", event_time)
+            if event.phase in {
+                "started", "foreground-start", "background-start", "running", "working",
+                "phase", "in_progress", "drafting",
+            }:
+                milestones.setdefault("working", event_time)
     merged_metadata = {**dict(previous.metadata or {}), **event.metadata} if previous else dict(event.metadata)
     if previous is not None and same_generation and previous.metadata and previous.metadata.get("relay_title"):
         merged_metadata["relay_title"] = previous.metadata["relay_title"]
@@ -600,7 +779,8 @@ def reduce_task_card_state(
         scope_id=event.scope_id,
         session_key=event.session_key,
         summary=event.summary,
-        updated_at=now_iso(),
+        updated_at=event_time,
+        generation_started_at=generation_started_at,
         activity_snapshot=event.activity_snapshot,
         metadata=merged_metadata,
         retired_generations=retired_generations,
@@ -753,14 +933,18 @@ class TaskCardManager:
         debounce_seconds: float = 0.75,
         publish_retry_seconds: float = 0.25,
         publish_retry_attempts: int = 2,
+        heartbeat_seconds: float = 30.0,
     ):
         self.store = store or TaskCardStore()
         self.debounce_seconds = max(0.0, float(debounce_seconds))
         self.publish_retry_seconds = max(0.0, float(publish_retry_seconds))
         self.publish_retry_attempts = max(1, int(publish_retry_attempts))
+        self.heartbeat_seconds = max(0.0, float(heartbeat_seconds))
         self._state_cache: dict[tuple[str, str], TaskCardState] = {}
         self._publishers: dict[tuple[str, str], Any] = {}
         self._pending_handles: dict[tuple[str, str], asyncio.TimerHandle] = {}
+        self._heartbeat_handles: dict[tuple[str, str], asyncio.TimerHandle] = {}
+        self._finalized_heartbeat_keys: set[tuple[str, str]] = set()
         self._publish_tasks: set[asyncio.Task[Any]] = set()
         self._publish_tasks_by_key: dict[tuple[str, str], set[asyncio.Task[Any]]] = {}
         self._publish_locks: dict[tuple[str, str], asyncio.Lock] = {}
@@ -798,8 +982,14 @@ class TaskCardManager:
         if handle is not None:
             handle.cancel()
 
+    def _cancel_heartbeat(self, key: tuple[str, str]) -> None:
+        handle = self._heartbeat_handles.pop(key, None)
+        if handle is not None:
+            handle.cancel()
+
     def _cancel_transaction(self, key: tuple[str, str]) -> None:
         self._cancel_pending(key)
+        self._cancel_heartbeat(key)
         for task in list(self._publish_tasks_by_key.pop(key, set())):
             task.cancel()
         self._rollback_states.pop(key, None)
@@ -842,6 +1032,8 @@ class TaskCardManager:
         state: TaskCardState,
         *,
         publication_revision: Any = _USE_STATE_REVISION,
+        persist_result: bool = True,
+        heartbeat: bool = False,
     ) -> None:
         lock = self._publish_locks.setdefault(key, asyncio.Lock())
         async with lock:
@@ -850,6 +1042,8 @@ class TaskCardManager:
                 publisher,
                 state,
                 publication_revision=publication_revision,
+                persist_result=persist_result,
+                heartbeat=heartbeat,
             )
 
     async def _publish_state(
@@ -859,6 +1053,8 @@ class TaskCardManager:
         state: TaskCardState,
         *,
         publication_revision: Any = _USE_STATE_REVISION,
+        persist_result: bool = True,
+        heartbeat: bool = False,
     ) -> None:
         topic_identity, binding = key
         metadata = {
@@ -954,23 +1150,25 @@ class TaskCardManager:
                         and current.generation == state.generation
                         and current.revision == state.revision
                     ):
-                        current = replace(
-                            current,
-                            content_hash=(
-                                state.content_hash
-                                if publication_revision is None
-                                else current.content_hash
-                            ),
-                            **(
-                                {"platform_message_id": str(message_id)}
-                                if message_id
-                                else {}
-                            ),
-                        )
-                        self._state_cache[key] = current
-                        self.store.save(current)
-                        self._rollback_states.pop(key, None)
-                        self._resolve_publication_acks(state, True)
+                        if persist_result:
+                            current = replace(
+                                current,
+                                content_hash=(
+                                    state.content_hash
+                                    if publication_revision is None
+                                    else current.content_hash
+                                ),
+                                **(
+                                    {"platform_message_id": str(message_id)}
+                                    if message_id
+                                    else {}
+                                ),
+                            )
+                            self._state_cache[key] = current
+                            self.store.save(current)
+                            self._rollback_states.pop(key, None)
+                            self._resolve_publication_acks(state, True)
+                        self._schedule_heartbeat(current, publisher)
                     else:
                         delivered = (
                             replace(state, platform_message_id=str(message_id))
@@ -1007,6 +1205,8 @@ class TaskCardManager:
                     self._state_cache[key] = previous
                     self.store.save(previous)
         self._resolve_publication_acks(state, False)
+        if heartbeat:
+            self._cancel_heartbeat(key)
 
     def _spawn_publish(
         self,
@@ -1014,6 +1214,8 @@ class TaskCardManager:
         publisher: Any,
         *,
         publication_revision: Any = _USE_STATE_REVISION,
+        persist_result: bool = True,
+        heartbeat: bool = False,
     ) -> None:
         key = (state.topic_identity, state.binding)
         task = asyncio.get_running_loop().create_task(
@@ -1022,6 +1224,8 @@ class TaskCardManager:
                 publisher,
                 state,
                 publication_revision=publication_revision,
+                persist_result=persist_result,
+                heartbeat=heartbeat,
             )
         )
         self._publish_tasks.add(task)
@@ -1037,9 +1241,75 @@ class TaskCardManager:
 
         task.add_done_callback(discard)
 
+    def _schedule_heartbeat(self, state: TaskCardState, publisher: Any) -> None:
+        key = (state.topic_identity, state.binding)
+        self._cancel_heartbeat(key)
+        is_relay = state.binding.startswith("relay:")
+        is_structured_automatic = (
+            state.binding.startswith(("foreground:", "background:"))
+            and bool(state.items)
+        )
+        if (
+            self.heartbeat_seconds <= 0
+            or publisher is None
+            or state.terminal
+            or state.phase in {"approval", "approval_needed"}
+            or not (is_relay or is_structured_automatic)
+            or key in self._finalized_heartbeat_keys
+            or state.platform != "telegram"
+            or not state.platform_message_id
+            or not _fits_heartbeat_message(render_task_card(state))
+        ):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        generation = state.generation
+        revision = state.revision
+        message_id = state.platform_message_id
+
+        def enqueue() -> None:
+            self._heartbeat_handles.pop(key, None)
+            current = self.current_state(state.binding, state.topic_identity)
+            if (
+                current is None
+                or current.terminal
+                or current.generation != generation
+                or current.revision != revision
+                or current.platform_message_id != message_id
+                or self._publishers.get(key) is not publisher
+            ):
+                return
+            self._spawn_publish(
+                current,
+                publisher,
+                publication_revision=None,
+                persist_result=False,
+                heartbeat=True,
+            )
+
+        self._heartbeat_handles[key] = loop.call_later(self.heartbeat_seconds, enqueue)
+
+    def cleanup_session(
+        self,
+        session_id: str | None = None,
+        session_key: str | None = None,
+    ) -> None:
+        """Cancel only heartbeats owned by a finalized session."""
+        owner = session_key or session_id
+        if not owner:
+            return
+        with self._lock:
+            for key, state in list(self._state_cache.items()):
+                if state.session_key == owner:
+                    self._cancel_heartbeat(key)
+                    self._finalized_heartbeat_keys.add(key)
+
     def _schedule_publish(self, state: TaskCardState, publisher: Any) -> bool:
         key = (state.topic_identity, state.binding)
         self._cancel_pending(key)
+        self._cancel_heartbeat(key)
         if publisher is None:
             return False
         try:
@@ -1091,20 +1361,23 @@ class TaskCardManager:
     ) -> TaskCardState:
         with self._lock:
             key = (event.topic_identity, event.binding)
+            self._finalized_heartbeat_keys.discard(key)
             previous = self.current_state(event.binding, event.topic_identity)
             next_state = reduce_task_card_state(previous, event)
             changed = next_state is not previous
+            self._cancel_heartbeat(key)
+            if publisher is not None:
+                self._publishers[key] = publisher
             if not changed:
                 if publication_ack is not None and not publication_ack.done():
                     if key in self._rollback_states:
                         self._register_publication_ack(next_state, publication_ack)
                     else:
                         publication_ack.set_result(True)
+                self._schedule_heartbeat(next_state, publisher or self._publishers.get(key))
                 return next_state
             if changed:
                 self._state_cache[key] = next_state
-            if publisher is not None:
-                self._publishers[key] = publisher
             if changed:
                 if publication_ack is None and key in self._rollback_states:
                     self._cancel_transaction(key)
@@ -1412,6 +1685,16 @@ def _on_pre_llm_call(**_: Any) -> dict[str, str]:
     return {"context": "For multi-step work or a requested checklist, use the todo tool to create and update the task list so the live task card stays current."}
 
 
+def _on_session_finalize(
+    *,
+    session_id: str | None = None,
+    session_key: str | None = None,
+    **_: Any,
+) -> None:
+    for manager in list(_MANAGERS.values()):
+        manager.cleanup_session(session_id=session_id, session_key=session_key)
+
+
 def register(ctx: Any) -> None:
     ctx.register_command(
         "taskcard",
@@ -1420,6 +1703,7 @@ def register(ctx: Any) -> None:
         args_hint="[show|bind <label>|refresh|debug|flush|reset|close]",
     )
     ctx.register_hook("gateway_activity", _on_gateway_activity)
+    ctx.register_hook("on_session_finalize", _on_session_finalize)
     ctx.register_hook("pre_llm_call", _on_pre_llm_call)
 
 

@@ -84,6 +84,7 @@ async def test_reset_fires_finalize_hook(mock_invoke_hook):
     assert any(
         c.args == ("on_session_finalize",)
         and c.kwargs["session_id"] == "sess-old"
+        and c.kwargs["session_key"] == build_session_key(_make_source())
         and c.kwargs["platform"] == "telegram"
         and c.kwargs["old_session_id"] == "sess-old"
         and c.kwargs["new_session_id"] == "sess-new"
@@ -162,8 +163,10 @@ async def test_shutdown_fires_finalize_for_active_agents(mock_invoke_hook):
         c for c in mock_invoke_hook.call_args_list
         if c[0][0] == "on_session_finalize"
     ]
-    session_ids = {c[1]["session_id"] for c in finalize_calls}
-    assert session_ids == {"sess-a", "sess-b"}
+    assert {
+        (c.kwargs["session_key"], c.kwargs["session_id"])
+        for c in finalize_calls
+    } == {("key-a", "sess-a"), ("key-b", "sess-b")}
 
 
 @pytest.mark.asyncio
@@ -248,10 +251,10 @@ async def test_idle_expiry_fires_finalize_hook(mock_invoke_hook):
         c for c in mock_invoke_hook.call_args_list
         if c[0] and c[0][0] == "on_session_finalize"
     ]
-    session_ids = {c[1].get("session_id") for c in finalize_calls}
-    assert "sess-expired" in session_ids, (
-        f"on_session_finalize was not fired during idle expiry; "
-        f"got session_ids={session_ids} (regression of #14981)"
+    assert any(
+        call.kwargs.get("session_id") == "sess-expired"
+        and call.kwargs.get("session_key") == session_key
+        for call in finalize_calls
     )
 
 

@@ -234,6 +234,7 @@ class GatewaySlashCommandsMixin:
             _invoke_hook(
                 "on_session_finalize",
                 session_id=_old_sid,
+                session_key=session_key,
                 platform=source.platform.value if source.platform else "",
                 reason="new_session",
                 old_session_id=_old_sid,

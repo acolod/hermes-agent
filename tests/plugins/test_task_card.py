@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -44,6 +44,7 @@ def _context(
     status: Any = None,
     thread_id: str = "topic-9",
     profile: str | None = None,
+    session_key: str = "session-1",
 ) -> PluginCommandContext:
     return PluginCommandContext(
         command="taskcard",
@@ -52,7 +53,7 @@ def _context(
             platform="telegram",
             chat_id="chat-1",
             thread_id=thread_id,
-            session_key="session-1",
+            session_key=session_key,
             profile=profile,
         ),
         status=status,
@@ -115,7 +116,7 @@ def test_manifest_is_discoverable_and_registers_contextual_command_and_hook():
     assert name == "taskcard"
     assert "context" in inspect.signature(handler).parameters
     assert metadata["args_hint"].startswith("[show|bind")
-    assert {name for name, _ in registered["hooks"]} == {"gateway_activity", "pre_llm_call"}
+    assert {name for name, _ in registered["hooks"]} == {"gateway_activity", "on_session_finalize", "pre_llm_call"}
 
 
 def test_public_renderer_is_a_concise_checklist_without_diagnostic_metadata(tmp_path):
@@ -311,15 +312,15 @@ def test_relay_without_todos_renders_full_completed_lifecycle_and_details(tmp_pa
     rendered = plugin.render_task_card(completed)
 
     assert completed.items == ()
-    assert "✅ **Completed**" in rendered
-    assert "**No-Todo Relay lifecycle**" in rendered
-    assert "- ✅ Received" in rendered
-    assert "- ✅ Picked up" in rendered
-    assert "- ✅ Working" in rendered
-    assert "- ✅ Completed" in rendered
-    assert "**Duration:**" in rendered
-    assert "**Result:** Lifecycle completed safely." in rendered
-    assert "**Next:** Await follow-up." in rendered
+    assert rendered.startswith("✅ COMPLETED\nNo-Todo Relay lifecycle\n")
+    assert "✅ Received" in rendered
+    assert "✅ Picked up" in rendered
+    assert "✅ Working" in rendered
+    assert "✅ Completed" in rendered
+    assert "── OUTCOME ──" in rendered
+    assert "Duration:" in rendered
+    assert "Result: Lifecycle completed safely." in rendered
+    assert "Next: Await follow-up." in rendered
 
 
 def test_relay_active_working_row_uses_in_progress_marker_without_todos(tmp_path):
@@ -343,10 +344,11 @@ def test_relay_active_working_row_uses_in_progress_marker_without_todos(tmp_path
     assert state is not None
     rendered = plugin.render_task_card(state)
 
-    assert "- ✅ Received" in rendered
-    assert "- ✅ Picked up" in rendered
-    assert "- 🔄 Working" in rendered
-    assert "- ⬜ Awaiting outcome" in rendered
+    assert "✅ Received" in rendered
+    assert "✅ Picked up" in rendered
+    assert "🔄 Working" in rendered
+    assert "⬜ Completed" in rendered
+    assert "Awaiting outcome" not in rendered
 
 
 def test_relay_approval_before_working_keeps_working_row_pending(tmp_path):
@@ -367,8 +369,8 @@ def test_relay_approval_before_working_keeps_working_row_pending(tmp_path):
     rendered = plugin.render_task_card(approval)
 
     assert "working" not in approval.lifecycle_milestones
-    assert "- ⬜ Working" in rendered
-    assert "- 🟡 Approval needed" in rendered
+    assert "⬜ Working" in rendered
+    assert rendered.startswith("🟡 APPROVAL NEEDED\n")
 
 
 def test_terminal_relay_without_working_milestone_keeps_working_row_pending(tmp_path):
@@ -390,18 +392,18 @@ def test_terminal_relay_without_working_milestone_keeps_working_row_pending(tmp_
     rendered = plugin.render_task_card(terminal)
 
     assert "working" not in terminal.lifecycle_milestones
-    assert "- ⬜ Working" in rendered
-    assert "- ❌ Failed" in rendered
+    assert "⬜ Working" in rendered
+    assert rendered.startswith("❌ FAILED\n")
 
 
 @pytest.mark.parametrize(
-    ("phase", "terminal", "heading", "outcome"),
+    ("phase", "terminal", "heading"),
     [
-        ("completed", True, "✅ **Completed**", "✅ Completed"),
-        ("failed", True, "❌ **Failed**", "❌ Failed"),
-        ("blocked", True, "⚠️ **Blocked**", "⚠️ Blocked"),
-        ("cancelled", True, "⛔ **Cancelled**", "⛔ Cancelled"),
-        ("approval_needed", False, "🟡 **Approval needed**", "🟡 Approval needed"),
+        ("completed", True, "✅ COMPLETED"),
+        ("failed", True, "❌ FAILED"),
+        ("blocked", True, "⚠️ BLOCKED"),
+        ("cancelled", True, "⛔ CANCELLED"),
+        ("approval_needed", False, "🟡 APPROVAL NEEDED"),
     ],
 )
 def test_relay_outcome_row_and_heading_follow_lifecycle_phase(
@@ -409,7 +411,6 @@ def test_relay_outcome_row_and_heading_follow_lifecycle_phase(
     phase,
     terminal,
     heading,
-    outcome,
 ):
     plugin = _load_plugin()
     manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0)
@@ -439,9 +440,10 @@ def test_relay_outcome_row_and_heading_follow_lifecycle_phase(
 
     rendered = plugin.render_task_card(state)
 
-    assert heading in rendered
-    assert f"- {outcome}" in rendered
-    assert "- ⬜ Working" in rendered
+    assert rendered.startswith(f"{heading}\n")
+    assert ("── OUTCOME ──" in rendered) is terminal
+    assert ("── STATUS ──" in rendered) is (not terminal)
+    assert "⬜ Working" in rendered or phase == "completed"
 
 
 def test_terminal_relay_card_persists_timestamped_milestones_and_terminal_fields(tmp_path):
@@ -472,14 +474,14 @@ def test_terminal_relay_card_persists_timestamped_milestones_and_terminal_fields
     rendered = plugin.render_task_card(terminal)
 
     assert set(terminal.lifecycle_milestones) == {"received", "picked_up", "working", "terminal"}
-    assert "**Task Card lifecycle merge**" in rendered
-    assert "- ✅ ~~Merge lifecycle cards~~" in rendered
-    assert "- ✅ Received" in rendered
-    assert "- ✅ Picked up" in rendered
-    assert "- ✅ Working" in rendered
-    assert "- ✅ Completed" in rendered
+    assert "Task Card lifecycle merge" in rendered
+    assert "✅ 1. ~~*Merge lifecycle cards*~~" in rendered
+    assert "✅ Received" in rendered
+    assert "✅ Picked up" in rendered
+    assert "✅ Working" in rendered
+    assert "✅ Completed" in rendered
     assert "Merged safely." in rendered
-    assert "**Duration:**" in rendered
+    assert "Duration:" in rendered
     assert "Await follow-up." in rendered
 
 
@@ -497,7 +499,7 @@ def test_missing_source_ids_are_stable_across_snapshot_reordering():
     }
 
 
-def test_structured_items_are_bounded_to_the_highest_priority_sixteen():
+def test_structured_items_preserve_every_first_seen_task():
     plugin = _load_plugin()
     items = plugin._task_items_from_snapshot(
         {"todos": [{"id": f"item-{index}", "content": f"Step {index}"} for index in range(20)]}
@@ -2106,3 +2108,912 @@ def test_same_label_is_isolated_between_topics(tmp_path):
     manager.handle_command("reset", first_context)
     assert manager.current_state("shared", first_topic) is None
     assert manager.current_state("shared", second_topic) == second
+
+
+def _relay_state(plugin, tmp_path, *, phase, revision=1, terminal=False, **snapshot):
+    manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0)
+    context = _context()
+    context.metadata["surface"] = "status_ingress"
+    state = manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "relay",
+            "activity_id": "relay:public-contract",
+            "generation": "public-contract",
+            "revision": revision,
+            "phase": phase,
+            "status": phase,
+            "terminal": terminal,
+            "metadata": {"relay_title": "Confirm the exact Relay contract"},
+            **snapshot,
+        },
+    )
+    assert state is not None
+    return manager, context, state
+
+
+@pytest.mark.parametrize(
+    ("phase", "heading", "progress"),
+    [
+        ("started", "📬 RECEIVED", ("✅", "⬜", "⬜", "⬜")),
+        ("picked_up", "👀 PICKED UP", ("⬜", "✅", "⬜", "⬜")),
+        ("working", "🔄 WORKING", ("⬜", "⬜", "🔄", "⬜")),
+        ("approval_needed", "🟡 APPROVAL NEEDED", ("⬜", "⬜", "⬜", "⬜")),
+    ],
+)
+def test_exact_relay_active_stage_snapshots(tmp_path, monkeypatch, phase, heading, progress):
+    plugin = _load_plugin()
+    monkeypatch.setattr(plugin, "now_iso", lambda: "2026-07-20T12:00:47+00:00")
+    _, _, state = _relay_state(
+        plugin,
+        tmp_path,
+        phase=phase,
+        task_items=[
+            {"id": "confirm", "label": "Confirm the task title", "status": "completed"},
+            {"id": "publish", "label": "Publish the card", "status": "in_progress"},
+        ],
+    )
+    state = plugin.replace(state, generation_started_at="2026-07-20T12:00:00+00:00")
+    status_line = "🟡 Approval needed" if phase == "approval_needed" else "⏱ Running · 47s"
+
+    assert plugin.render_task_card(state) == (
+        f"{heading}\n"
+        "Confirm the exact Relay contract\n\n"
+        "── PROGRESS ──\n"
+        f"{progress[0]} Received\n"
+        f"{progress[1]} Picked up\n"
+        f"{progress[2]} Working\n"
+        f"{progress[3]} Completed\n\n"
+        "── TASK LIST ──\n"
+        "✅ 1. ~~*Confirm the task title*~~\n"
+        "▶️ 2. Publish the card\n\n"
+        "── STATUS ──\n"
+        + status_line
+    )
+
+
+@pytest.mark.parametrize(
+    ("phase", "heading", "result", "next_action"),
+    [
+        ("completed", "✅ COMPLETED", "Relay contract shipped.", "No action needed."),
+        ("blocked", "⚠️ BLOCKED", "Waiting for a maintainer.", "Ask the maintainer."),
+        ("failed", "❌ FAILED", "Publication failed.", "Retry publication."),
+        ("cancelled", "⛔ CANCELLED", "Task was cancelled.", "No further action."),
+    ],
+)
+def test_exact_relay_terminal_snapshots(tmp_path, monkeypatch, phase, heading, result, next_action):
+    plugin = _load_plugin()
+    times = iter((
+        "2026-07-20T12:00:00+00:00",
+        "2026-07-20T12:00:00+00:00",
+        "2026-07-20T12:01:20+00:00",
+    ))
+    monkeypatch.setattr(plugin, "now_iso", lambda: next(times))
+    manager, context, _ = _relay_state(
+        plugin,
+        tmp_path,
+        phase="started",
+        revision=1,
+        metadata={
+            "relay_title": "Confirm the exact Relay contract",
+            "next_action": next_action,
+        },
+        task_items=[{"id": "confirm", "label": "Confirm the task title", "status": "completed"}],
+    )
+    state = manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "relay", "activity_id": "relay:public-contract",
+            "generation": "public-contract", "revision": 2, "phase": phase,
+            "status": phase, "terminal": True,
+            "summary": f"{result} Next: duplicate text that must be removed.",
+            "metadata": {
+                "relay_title": "Confirm the exact Relay contract",
+                "next_action": next_action,
+            },
+        },
+    )
+
+    assert plugin.render_task_card(state) == (
+        f"{heading}\n"
+        "Confirm the exact Relay contract\n\n"
+        "── PROGRESS ──\n"
+        "✅ Received\n"
+        f"{'✅' if phase == 'completed' else '⬜'} Picked up\n"
+        f"{'✅' if phase == 'completed' else '⬜'} Working\n"
+        f"{'✅' if phase == 'completed' else '⬜'} Completed\n\n"
+        "── TASK LIST ──\n"
+        "✅ 1. ~~*Confirm the task title*~~\n\n"
+        "── OUTCOME ──\n"
+        "Duration: 1m 20s\n"
+        f"Result: {result}\n"
+        f"Next: {next_action}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("phase", "state_key", "summary", "expected"),
+    [
+        ("completed", "done", "Stopped on verification mismatch.", "Task completed successfully."),
+        ("completed", "done", "Stopped on mismatch; no terminal completion was claimed.", "Task completed successfully."),
+        ("completed", "done", "Stopped because of verification mismatch.", "Task completed successfully."),
+        ("completed", "done", "Stopped due to verification mismatch.", "Task completed successfully."),
+        ("completed", "done", "Blocked by missing approval.", "Task completed successfully."),
+        ("completed", "done", "Failed to publish terminal event.", "Task completed successfully."),
+        ("completed", "done", "Unable to verify terminal delivery.", "Task completed successfully."),
+        ("completed", "done", "Stopped duplicate alerts.", "Stopped duplicate alerts."),
+        ("completed", "done", "Blocked duplicate delivery.", "Blocked duplicate delivery."),
+        ("completed", "done", "Failed checks were fixed.", "Failed checks were fixed."),
+        ("completed", "done", "Cancelled duplicate retries.", "Cancelled duplicate retries."),
+        ("completed", "done", "Fixed three failed checks.", "Fixed three failed checks."),
+        ("completed", "done", "Completed with one warning.", "Completed with one warning."),
+        ("failed", "failed", "Stopped on verification mismatch.", "Stopped on verification mismatch."),
+        ("blocked", "blocked", "Stopped on verification mismatch.", "Stopped on verification mismatch."),
+        ("ready_for_alex", "ready", "Stopped on verification mismatch.", "Stopped on verification mismatch."),
+    ],
+)
+def test_relay_result_only_replaces_contradictory_summary_for_authoritative_done_terminal(
+    phase, state_key, summary, expected,
+):
+    plugin = _load_plugin()
+    state = plugin.TaskCardState(
+        binding="relay:terminal-authority",
+        topic_identity="topic-1",
+        generation="generation-1",
+        activity_kind="relay",
+        activity_id="relay:terminal-authority",
+        platform_message_id="16678",
+        revision=8,
+        revision_hash="revision",
+        content_hash="content",
+        command="taskcard",
+        phase=phase,
+        status=phase,
+        terminal=True,
+        surface="status_ingress",
+        summary=summary,
+        metadata={"state_key": state_key, "next_action": "No action needed."},
+        lifecycle_milestones={"terminal": "2026-07-21T12:00:00+00:00"},
+    )
+
+    rendered = plugin.render_task_card(state)
+
+    assert f"Result: {expected}" in rendered
+
+
+def test_relay_no_todo_wrapped_title_and_long_task_snapshots(tmp_path, monkeypatch):
+    plugin = _load_plugin()
+    monkeypatch.setattr(plugin, "now_iso", lambda: "2026-07-20T13:04:00+00:00")
+    long_title = "A supplied title that Telegram may wrap naturally without the formatter changing it"
+    long_task = "Verify every first-seen task remains visible with its exact supplied label even when the line is long"
+    _, _, no_todo = _relay_state(
+        plugin,
+        tmp_path / "empty",
+        phase="working",
+        metadata={"relay_title": long_title},
+    )
+    no_todo = plugin.replace(no_todo, generation_started_at="2026-07-20T12:00:00+00:00")
+    _, _, with_task = _relay_state(
+        plugin,
+        tmp_path / "long",
+        phase="working",
+        metadata={"relay_title": long_title},
+        task_items=[{"id": "long", "label": long_task, "status": "pending"}],
+    )
+    with_task = plugin.replace(with_task, generation_started_at="2026-07-20T12:00:00+00:00")
+
+    assert plugin.render_task_card(no_todo) == (
+        "🔄 WORKING\n"
+        f"{long_title}\n\n"
+        "── PROGRESS ──\n⬜ Received\n⬜ Picked up\n🔄 Working\n⬜ Completed\n\n"
+        "── TASK LIST ──\n\n"
+        "── STATUS ──\n⏱ Running · 1h 4m"
+    )
+    assert f"⬜ 1. {long_task}" in plugin.render_task_card(with_task)
+    assert "Awaiting outcome" not in plugin.render_task_card(no_todo)
+
+
+def test_duration_formatter_contract():
+    plugin = _load_plugin()
+    assert plugin._format_duration(47) == "47s"
+    assert plugin._format_duration(80) == "1m 20s"
+    assert plugin._format_duration(3_840) == "1h 4m"
+
+
+def test_task_merge_preserves_first_seen_order_omissions_and_fresh_generation(tmp_path):
+    plugin = _load_plugin()
+    manager, context, first = _relay_state(
+        plugin,
+        tmp_path,
+        phase="started",
+        revision=1,
+        task_items=[
+            {"id": "a", "label": "Alpha", "status": "completed"},
+            {"id": "b", "label": "Beta", "status": "pending"},
+        ],
+    )
+    later = manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "relay", "activity_id": "relay:public-contract",
+            "generation": "public-contract", "revision": 2, "phase": "working", "status": "working",
+            "task_items": [
+                {"id": "b", "label": "Beta renamed", "status": "in_progress"},
+                {"id": "c", "label": "Gamma", "status": "pending"},
+            ],
+        },
+    )
+    assert [(item.item_id, item.label, item.status) for item in later.items] == [
+        ("a", "Alpha", "complete"),
+        ("b", "Beta renamed", "active"),
+        ("c", "Gamma", "pending"),
+    ]
+    terminal = manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "relay", "activity_id": "relay:public-contract",
+            "generation": "public-contract", "revision": 3, "phase": "completed", "status": "completed", "terminal": True,
+        },
+    )
+    fresh = manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "relay", "activity_id": "relay:public-contract", "generation": "fresh", "revision": 1,
+            "phase": "started", "status": "started",
+            "task_items": [{"id": "z", "label": "Fresh", "status": "pending"}],
+        },
+    )
+    assert terminal.items == later.items
+    assert [(item.item_id, item.label) for item in fresh.items] == [("z", "Fresh")]
+    assert "⬜ 1. Fresh" in plugin.render_task_card(fresh)
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_is_null_revision_presentation_only_and_activity_coalesces(tmp_path):
+    plugin = _load_plugin()
+    status = _CaptureStatus()
+    manager = plugin.TaskCardManager(
+        plugin.TaskCardStore(tmp_path), debounce_seconds=0, heartbeat_seconds=0.02,
+    )
+    context = _context(status=status)
+    context.metadata["surface"] = "status_ingress"
+    manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "relay", "activity_id": "relay:heartbeat", "generation": "heartbeat", "revision": 1,
+            "phase": "working", "status": "working", "metadata": {"relay_title": "Heartbeat"},
+        },
+    )
+    await manager.wait_for_publishes()
+    before = manager.current_state("relay:heartbeat")
+    calls = len(status.calls)
+    await asyncio.sleep(0.025)
+    await manager.wait_for_publishes()
+    after = manager.current_state("relay:heartbeat")
+
+    assert len(status.calls) == calls + 1
+    assert status.calls[-1]["revision"] is None
+    assert after == before
+
+    manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "relay", "activity_id": "relay:heartbeat", "generation": "heartbeat", "revision": 2,
+            "phase": "working", "status": "working",
+            "task_items": [{"id": "one", "label": "Real activity", "status": "in_progress"}],
+        },
+    )
+    await asyncio.sleep(0.01)
+    await manager.wait_for_publishes()
+    assert status.calls[-1]["revision"] == 2
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_cancels_for_terminal_replacement_reset_and_stale_race(tmp_path):
+    plugin = _load_plugin()
+    status = _CaptureStatus()
+    manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0, heartbeat_seconds=0.02)
+    context = _context(status=status)
+    context.metadata["surface"] = "status_ingress"
+    common = {"kind": "relay", "activity_id": "relay:cancel-heartbeat", "generation": "old"}
+    manager.on_gateway_activity(context=context, activity_snapshot={**common, "revision": 1, "phase": "working", "status": "working"})
+    await manager.wait_for_publishes()
+    terminal = manager.on_gateway_activity(context=context, activity_snapshot={**common, "revision": 2, "phase": "completed", "status": "completed", "terminal": True})
+    await manager.wait_for_publishes()
+    terminal = manager.current_state("relay:cancel-heartbeat")
+    calls = len(status.calls)
+    await asyncio.sleep(0.03)
+    await manager.wait_for_publishes()
+    assert len(status.calls) == calls
+    assert manager.current_state("relay:cancel-heartbeat") == terminal
+
+    manager.handle_command("bind replacement", context)
+    await manager.wait_for_publishes()
+    manager.handle_command("reset", context)
+    await asyncio.sleep(0.03)
+    await manager.wait_for_publishes()
+    assert manager.current_state("replacement") is None
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_recovers_after_restart_and_reattachment_without_state_mutation(tmp_path):
+    plugin = _load_plugin()
+    first_status = _CaptureStatus()
+    first = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0, heartbeat_seconds=60)
+    context = _context(status=first_status)
+    context.metadata["surface"] = "status_ingress"
+    active = first.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "relay", "activity_id": "relay:persisted", "generation": "persisted",
+            "revision": 1, "phase": "working", "status": "working", "summary": "Still working",
+        },
+    )
+    await first.wait_for_publishes()
+    active = first.current_state("relay:persisted")
+
+    restarted_status = _CaptureStatus()
+    restarted = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0, heartbeat_seconds=0.02)
+    restarted_context = _context(status=restarted_status)
+    restarted_context.metadata["surface"] = "status_ingress"
+    reattached = restarted.on_gateway_activity(
+        context=restarted_context,
+        activity_snapshot={
+            "kind": "relay", "activity_id": "relay:persisted", "generation": "persisted",
+            "revision": 1, "phase": "working", "status": "working", "summary": "Still working",
+        },
+    )
+    await asyncio.sleep(0.025)
+    await restarted.wait_for_publishes()
+
+    assert reattached == active
+    assert restarted_status.calls[-1]["revision"] is None
+    assert restarted.current_state("relay:persisted") == active
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_stops_when_publisher_ownership_is_lost(tmp_path):
+    plugin = _load_plugin()
+    status = _CaptureStatus()
+    manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0, heartbeat_seconds=0.02)
+    context = _context(status=status)
+    context.metadata["surface"] = "status_ingress"
+    state = manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "relay", "activity_id": "relay:owner", "generation": "owner", "revision": 1,
+            "phase": "working", "status": "working",
+        },
+    )
+    await manager.wait_for_publishes()
+    manager._publishers.pop((state.topic_identity, state.binding))
+    calls = len(status.calls)
+
+    await asyncio.sleep(0.03)
+    await manager.wait_for_publishes()
+
+    assert len(status.calls) == calls
+
+
+@pytest.mark.asyncio
+async def test_terminal_update_wins_a_heartbeat_publish_race(tmp_path):
+    plugin = _load_plugin()
+
+    class BlockingHeartbeatStatus(_CaptureStatus):
+        def __init__(self):
+            super().__init__()
+            self.heartbeat_started = asyncio.Event()
+            self.release_heartbeat = asyncio.Event()
+
+        async def upsert_status(self, status_key, content, *, revision=None, metadata=None):
+            self.calls.append({
+                "status_key": status_key, "content": content,
+                "revision": revision, "metadata": metadata,
+            })
+            if revision is None:
+                self.heartbeat_started.set()
+                await self.release_heartbeat.wait()
+            return SimpleNamespace(success=True, message_id="stable-message")
+
+    status = BlockingHeartbeatStatus()
+    manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0, heartbeat_seconds=0.01)
+    context = _context(status=status)
+    context.metadata["surface"] = "status_ingress"
+    common = {"kind": "relay", "activity_id": "relay:race", "generation": "race"}
+    manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={**common, "revision": 1, "phase": "working", "status": "working"},
+    )
+    await manager.wait_for_publishes()
+    await asyncio.wait_for(status.heartbeat_started.wait(), timeout=0.1)
+    manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            **common, "revision": 2, "phase": "completed", "status": "completed", "terminal": True,
+        },
+    )
+    status.release_heartbeat.set()
+    await manager.wait_for_publishes()
+
+    assert status.calls[-1]["revision"] == 2
+    assert status.calls[-1]["content"].startswith("✅ COMPLETED\n")
+    assert manager.current_state("relay:race").terminal is True
+
+
+@pytest.mark.asyncio
+async def test_concurrent_relay_heartbeats_edit_each_owned_message(tmp_path):
+    plugin = _load_plugin()
+    status = _CaptureStatus()
+    manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0, heartbeat_seconds=0.01)
+    context = _context(status=status)
+    context.metadata["surface"] = "status_ingress"
+    for task_id in ("first", "second"):
+        manager.on_gateway_activity(
+            context=context,
+            activity_snapshot={
+                "kind": "relay", "activity_id": f"relay:{task_id}", "generation": task_id,
+                "revision": 1, "phase": "working", "status": "working",
+                "metadata": {"relay_title": task_id.title()},
+            },
+        )
+    await manager.wait_for_publishes()
+    await asyncio.sleep(0.015)
+    await manager.wait_for_publishes()
+
+    heartbeats = [call for call in status.calls if call["revision"] is None]
+    assert {call["status_key"] for call in heartbeats} == {
+        "taskcard:relay:first", "taskcard:relay:second",
+    }
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_is_limited_to_single_message_relay_cards(tmp_path):
+    plugin = _load_plugin()
+    status = _CaptureStatus()
+    manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0, heartbeat_seconds=0.01)
+    context = _context(status=status)
+    manager.handle_command("bind Manual card", context)
+    await manager.wait_for_publishes()
+    manual_calls = len(status.calls)
+    await asyncio.sleep(0.02)
+    await manager.wait_for_publishes()
+    assert len(status.calls) == manual_calls
+
+    context.metadata["surface"] = "status_ingress"
+    oversized = manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "relay", "activity_id": "relay:oversized", "generation": "oversized",
+            "revision": 1, "phase": "working", "status": "working",
+            "metadata": {"relay_title": "Oversized Relay Card"},
+            "task_items": [
+                {"id": str(index), "label": "x" * 200, "status": "pending"}
+                for index in range(20)
+            ],
+        },
+    )
+    await manager.wait_for_publishes()
+    relay_calls = len(status.calls)
+    await asyncio.sleep(0.02)
+    await manager.wait_for_publishes()
+    assert oversized is not None
+    assert len(plugin.render_task_card(oversized).encode("utf-16-le")) // 2 > plugin.MAX_HEARTBEAT_CONTENT_UTF16_UNITS
+    assert len(status.calls) == relay_calls
+
+
+@pytest.mark.asyncio
+async def test_approval_card_stops_timer_and_uses_compact_status(tmp_path):
+    plugin = _load_plugin()
+    status = _CaptureStatus()
+    manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0, heartbeat_seconds=0.01)
+    context = _context(status=status)
+    context.metadata["surface"] = "status_ingress"
+    common = {"kind": "relay", "activity_id": "relay:approval", "generation": "approval"}
+    manager.on_gateway_activity(context=context, activity_snapshot={**common, "revision": 1, "phase": "working", "status": "working"})
+    await manager.wait_for_publishes()
+    approval = manager.on_gateway_activity(context=context, activity_snapshot={**common, "revision": 2, "phase": "approval", "status": "approval"})
+    await manager.wait_for_publishes()
+    calls = len(status.calls)
+    await asyncio.sleep(0.02)
+    await manager.wait_for_publishes()
+    rendered = plugin.render_task_card(approval)
+    assert "── STATUS ──\n🟡 Approval needed" in rendered
+    assert "⏱ Running" not in rendered
+    assert len(status.calls) == calls
+
+
+def test_task_items_remain_bounded_through_ingestion_merge_and_deserialization():
+    plugin = _load_plugin()
+    raw = [{"id": f"{index:03d}" + "i" * 200, "label": "l" * 200, "status": "pending"} for index in range(20)]
+    items = plugin._task_items_from_snapshot({"task_items": raw})
+    assert len(items) == 16
+    assert all(len(item.item_id) <= plugin.MAX_TASK_ITEM_ID_LENGTH for item in items)
+    assert all(len(item.label) <= plugin.MAX_TASK_ITEM_LABEL_LENGTH for item in items)
+    merged = plugin._merge_task_items(items, tuple(plugin.TaskCardItem("new", "new", "pending") for _ in range(2)))
+    assert len(merged) == 16
+    state = plugin.TaskCardState.from_dict({"items": raw})
+    assert len(state.items) == 16
+
+
+@pytest.mark.asyncio
+async def test_session_finalize_cancels_only_matching_heartbeat(tmp_path):
+    plugin = _load_plugin()
+    status = _CaptureStatus()
+    manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0, heartbeat_seconds=0.5)
+    for session_key in ("ending", "other"):
+        context = _context(status=status, session_key=session_key)
+        context.metadata["surface"] = "status_ingress"
+        manager.on_gateway_activity(context=context, activity_snapshot={"kind": "relay", "activity_id": f"relay:{session_key}", "generation": session_key, "revision": 1, "phase": "working", "status": "working"})
+    await manager.wait_for_publishes()
+    assert len(manager._heartbeat_handles) == 2
+    manager.cleanup_session("ending")
+    assert len(manager._heartbeat_handles) == 1
+    assert next(iter(manager._heartbeat_handles)).__contains__("relay:other")
+
+
+def test_session_finalize_prefers_routing_key_without_mutating_cards_or_other_handles(tmp_path):
+    plugin = _load_plugin()
+    manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0)
+    states = []
+    for kind, task_id, session_key in (
+        ("foreground", "ending", "route-ending"),
+        ("background", "other", "route-other"),
+    ):
+        states.append(manager.on_gateway_activity(
+            context=_context(session_key=session_key),
+            activity_snapshot={
+                "kind": kind, "task_id": task_id, "generation": task_id, "revision": 1,
+                "phase": "working", "status": "working",
+                "task_items": [{"id": "one", "label": task_id, "status": "in_progress"}],
+            },
+        ))
+    ending, other = states
+    ending_key = (ending.topic_identity, ending.binding)
+    other_key = (other.topic_identity, other.binding)
+    ending_handle, other_handle = MagicMock(), MagicMock()
+    manager._heartbeat_handles = {ending_key: ending_handle, other_key: other_handle}
+
+    manager.cleanup_session(session_id="durable-ending", session_key="route-ending")
+
+    ending_handle.cancel.assert_called_once()
+    other_handle.cancel.assert_not_called()
+    assert ending_key not in manager._heartbeat_handles
+    assert other_key in manager._heartbeat_handles
+    assert manager.current_state(ending.binding, ending.topic_identity) is ending
+    assert manager.current_state(other.binding, other.topic_identity) is other
+    assert ending.revision == 1 and other.revision == 1
+
+
+def test_session_finalize_falls_back_to_durable_id_for_legacy_state_owner(tmp_path):
+    plugin = _load_plugin()
+    manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0)
+    state = manager.on_gateway_activity(
+        context=_context(session_key="durable-id"),
+        activity_snapshot={
+            "kind": "foreground", "task_id": "legacy", "generation": "legacy", "revision": 1,
+            "phase": "working", "status": "working",
+            "task_items": [{"id": "one", "label": "Legacy state", "status": "in_progress"}],
+        },
+    )
+    key = (state.topic_identity, state.binding)
+    handle = MagicMock()
+    manager._heartbeat_handles = {key: handle}
+
+    manager.cleanup_session(session_id="durable-id")
+
+    handle.cancel.assert_called_once()
+    assert key not in manager._heartbeat_handles
+
+
+def test_session_cleanup_prevents_an_inflight_heartbeat_from_rescheduling(tmp_path):
+    plugin = _load_plugin()
+    manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0, heartbeat_seconds=60)
+    state = manager.on_gateway_activity(
+        context=_context(session_key="route-ending"),
+        activity_snapshot={
+            "kind": "foreground", "task_id": "ending", "generation": "ending", "revision": 1,
+            "phase": "working", "status": "working",
+            "task_items": [{"id": "one", "label": "Ending", "status": "in_progress"}],
+        },
+    )
+    state = plugin.replace(state, platform_message_id="message-1")
+    key = (state.topic_identity, state.binding)
+
+    manager.cleanup_session(session_id="durable-ending", session_key="route-ending")
+
+    async def schedule_after_cleanup():
+        manager._schedule_heartbeat(state, _CaptureStatus())
+        assert key not in manager._heartbeat_handles
+
+    asyncio.run(schedule_after_cleanup())
+
+
+@pytest.mark.parametrize("kind", ("foreground", "background"))
+def test_structured_automatic_cards_use_the_relay_presentation_contract(tmp_path, monkeypatch, kind):
+    plugin = _load_plugin()
+    monkeypatch.setattr(plugin, "now_iso", lambda: "2026-07-21T12:00:47+00:00")
+    manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0)
+    state = manager.on_gateway_activity(
+        context=_context(),
+        activity_snapshot={
+            "kind": kind,
+            "task_id": f"{kind}-private-id",
+            "activity_id": f"{kind}:{kind}-private-id",
+            "generation": "automatic-presentation",
+            "revision": 1,
+            "phase": "working",
+            "status": "working",
+            "task_items": [
+                {"id": "inspect", "label": "Inspect the renderer", "status": "completed"},
+                {"id": "publish", "label": "Publish the update", "status": "in_progress"},
+            ],
+        },
+    )
+
+    assert state is not None
+    assert state.lifecycle_milestones == {
+        "received": "2026-07-21T12:00:47+00:00",
+        "picked_up": "2026-07-21T12:00:47+00:00",
+        "working": "2026-07-21T12:00:47+00:00",
+    }
+    assert plugin.render_task_card(state) == (
+        "🔄 WORKING\n"
+        "Inspect the renderer\n\n"
+        "── PROGRESS ──\n"
+        "✅ Received\n"
+        "✅ Picked up\n"
+        "🔄 Working\n"
+        "⬜ Completed\n\n"
+        "── TASK LIST ──\n"
+        "✅ 1. ~~*Inspect the renderer*~~\n"
+        "▶️ 2. Publish the update\n\n"
+        "── STATUS ──\n"
+        "⏱ Running · 0s"
+    )
+
+
+def test_foreground_terminal_initial_sighting_completes_display_progress(tmp_path, monkeypatch):
+    plugin = _load_plugin()
+    monkeypatch.setattr(plugin, "now_iso", lambda: "2026-07-21T12:01:20+00:00")
+    manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0)
+    state = manager.on_gateway_activity(
+        context=_context(),
+        activity_snapshot={
+            "kind": "foreground", "task_id": "terminal-only", "generation": "terminal-only",
+            "revision": 3, "phase": "completed", "status": "completed", "terminal": True,
+            "summary": "Parity pass completed.",
+            "task_items": [{"id": "one", "label": "Ship the parity pass", "status": "completed"}],
+        },
+    )
+
+    assert state is not None
+    assert set(state.lifecycle_milestones) == {"received", "picked_up", "working", "terminal"}
+    rendered = plugin.render_task_card(state)
+    assert "✅ Received\n✅ Picked up\n✅ Working\n✅ Completed" in rendered
+    assert "Duration: 0s" in rendered
+    assert "Result: Parity pass completed." in rendered
+    assert "Next: No action needed." in rendered
+
+
+@pytest.mark.asyncio
+async def test_automatic_foreground_and_background_heartbeats_preserve_message_and_revision(tmp_path):
+    plugin = _load_plugin()
+    status = _CaptureStatus()
+    manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0, heartbeat_seconds=0.05)
+    context = _context(status=status)
+    context.metadata["surface"] = "status_ingress"
+    for kind in ("foreground", "background"):
+        manager.on_gateway_activity(
+            context=context,
+            activity_snapshot={
+                "kind": kind, "task_id": f"{kind}-heartbeat", "generation": f"{kind}-heartbeat",
+                "revision": 1, "phase": "working", "status": "working",
+                "task_items": [{"id": "one", "label": f"Keep {kind} alive", "status": "in_progress"}],
+            },
+        )
+    await manager.wait_for_publishes()
+    initial_calls = list(status.calls)
+    await asyncio.sleep(0.06)
+    await manager.wait_for_publishes()
+
+    heartbeats = [call for call in status.calls if call["revision"] is None]
+    assert len(heartbeats) == 2
+    for kind in ("foreground", "background"):
+        status_key = f"taskcard:{kind}:{kind}-heartbeat"
+        initial = [call for call in initial_calls if call["status_key"] == status_key]
+        heartbeat = [call for call in heartbeats if call["status_key"] == status_key]
+        state = manager.current_state(f"{kind}:{kind}-heartbeat")
+        assert len(initial) == 1
+        assert len(heartbeat) == 1
+        assert state is not None and state.platform_message_id
+        assert heartbeat[0]["revision"] is None
+        assert heartbeat[0]["metadata"]["status_message_id"] == state.platform_message_id
+        assert heartbeat[0]["metadata"]["preserve_status_message_id"] is True
+    for kind in ("foreground", "background"):
+        state = manager.current_state(f"{kind}:{kind}-heartbeat")
+        assert state is not None and state.revision == 1
+
+
+def test_background_terminal_without_items_preserves_structured_card_and_completes_progress(tmp_path, monkeypatch):
+    plugin = _load_plugin()
+    times = iter((
+        "2026-07-21T12:00:00+00:00",
+        "2026-07-21T12:00:00+00:00",
+        "2026-07-21T12:01:20+00:00",
+    ))
+    monkeypatch.setattr(plugin, "now_iso", lambda: next(times))
+    manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0)
+    context = _context()
+    started = manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "background", "task_id": "preserve", "generation": "preserve", "revision": 1,
+            "phase": "background-start", "status": "working",
+            "task_items": [{"id": "one", "label": "Preserve the task", "status": "completed"}],
+        },
+    )
+    terminal = manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "background", "task_id": "preserve", "generation": "preserve", "revision": 2,
+            "phase": "completed", "status": "completed", "terminal": True,
+            "summary": "Background task completed.",
+        },
+    )
+
+    assert started is not None and terminal is not None
+    assert terminal.items == started.items
+    assert terminal.platform_message_id == started.platform_message_id
+    assert terminal.generation == started.generation
+    assert set(terminal.lifecycle_milestones) == {"received", "picked_up", "working", "terminal"}
+    rendered = plugin.render_task_card(terminal)
+    assert "✅ Received\n✅ Picked up\n✅ Working\n✅ Completed" in rendered
+    assert "Duration: 1m 20s" in rendered
+    assert "Result: Background task completed." in rendered
+    assert "Next: No action needed." in rendered
+
+
+@pytest.mark.parametrize("kind,phase", (("foreground", "foreground-start"), ("background", "background-start"), ("foreground", "started")))
+def test_automatic_start_phases_render_active_working_progress(tmp_path, kind, phase):
+    plugin = _load_plugin()
+    manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0)
+    state = manager.on_gateway_activity(
+        context=_context(),
+        activity_snapshot={
+            "kind": kind, "task_id": f"{kind}-{phase}", "generation": phase, "revision": 1,
+            "phase": phase, "status": "working",
+            "task_items": [{"id": "one", "label": "Start automatic work", "status": "in_progress"}],
+        },
+    )
+
+    assert state is not None
+    assert "🔄 Working" in plugin.render_task_card(state)
+    assert "✅ Working" not in plugin.render_task_card(state)
+
+
+def test_foreground_items_keep_first_seen_ids_order_message_and_completion(tmp_path):
+    plugin = _load_plugin()
+    manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0)
+    context = _context()
+    first = manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "foreground", "task_id": "three-step", "generation": "three-step", "revision": 1,
+            "phase": "working", "status": "working",
+            "task_items": [
+                {"id": "one", "label": "First", "status": "completed"},
+                {"id": "two", "label": "Second", "status": "in_progress"},
+                {"id": "three", "label": "Third", "status": "pending"},
+            ],
+        },
+    )
+    first = plugin.replace(first, platform_message_id="stable-message")
+    manager._state_cache[(first.topic_identity, first.binding)] = first
+    later = manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "foreground", "task_id": "three-step", "generation": "three-step", "revision": 2,
+            "phase": "working", "status": "working",
+            "task_items": [
+                {"id": "three", "label": "Third", "status": "in_progress"},
+                {"id": "one", "label": "First renamed", "status": "pending"},
+                {"id": "two", "label": "Second", "status": "completed"},
+            ],
+        },
+    )
+
+    assert [(item.item_id, item.status) for item in later.items] == [
+        ("one", "complete"), ("two", "complete"), ("three", "active"),
+    ]
+    assert later.platform_message_id == "stable-message"
+
+
+@pytest.mark.parametrize(
+    "phase,summary,expected_heading,expected_next",
+    (
+        ("failed", "Publication failed.", "❌ FAILED", "Review the task and decide the next step."),
+        ("blocked", "Waiting for input.", "⚠️ BLOCKED", "Review the task and decide the next step."),
+        ("cancelled", "Task was cancelled.", "⛔ CANCELLED", "No action needed."),
+    ),
+)
+def test_automatic_terminal_states_keep_truthful_outcome_semantics(tmp_path, phase, summary, expected_heading, expected_next):
+    plugin = _load_plugin()
+    manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0)
+    state = manager.on_gateway_activity(
+        context=_context(),
+        activity_snapshot={
+            "kind": "foreground", "task_id": phase, "generation": phase, "revision": 1,
+            "phase": phase, "status": phase, "terminal": True, "summary": summary,
+            "task_items": [{"id": "one", "label": "Report the outcome", "status": "failed"}],
+        },
+    )
+
+    rendered = plugin.render_task_card(state)
+    assert rendered.startswith(f"{expected_heading}\n")
+    assert f"Result: {summary}" in rendered
+    assert f"Next: {expected_next}" in rendered
+
+
+def test_automatic_public_title_prefers_allowed_title_and_hides_internal_identifiers(tmp_path):
+    plugin = _load_plugin()
+    manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0)
+    state = manager.on_gateway_activity(
+        context=_context(),
+        activity_snapshot={
+            "kind": "background", "task_id": "private-task-id", "activity_id": "background:private-task-id",
+            "generation": "title", "revision": 1, "phase": "working", "status": "working",
+            "title": "Public activity title",
+            "task_items": [{"id": "private-item-id", "label": "Fallback Todo title", "status": "in_progress"}],
+        },
+    )
+
+    rendered = plugin.render_task_card(state)
+    assert "Public activity title" in rendered
+    assert "Fallback Todo title" in rendered
+    assert "private-task-id" not in rendered
+    assert "private-item-id" not in rendered
+
+
+def test_relay_without_supplied_title_keeps_existing_item_title_fallback(tmp_path):
+    plugin = _load_plugin()
+    manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0)
+    context = _context()
+    context.metadata["surface"] = "status_ingress"
+    state = manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "relay", "activity_id": "relay:title-fallback", "generation": "title-fallback",
+            "revision": 1, "phase": "working", "status": "working",
+            "task_items": [{"id": "one", "label": "Use the item title", "status": "in_progress"}],
+        },
+    )
+
+    rendered = plugin.render_task_card(state)
+    assert "Use the item title" in rendered
+    assert "\nNone\n" not in rendered
+
+
+def test_automatic_title_change_without_source_revision_updates_card_identity(tmp_path):
+    plugin = _load_plugin()
+    manager = plugin.TaskCardManager(plugin.TaskCardStore(tmp_path), debounce_seconds=0)
+    context = _context()
+    first = manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "foreground", "task_id": "title-update", "generation": "title-update",
+            "phase": "working", "status": "working", "title": "First public title",
+            "task_items": [{"id": "one", "label": "Stable task", "status": "in_progress"}],
+        },
+    )
+    updated = manager.on_gateway_activity(
+        context=context,
+        activity_snapshot={
+            "kind": "foreground", "task_id": "title-update", "generation": "title-update",
+            "phase": "working", "status": "working", "title": "Updated public title",
+            "task_items": [{"id": "one", "label": "Stable task", "status": "in_progress"}],
+        },
+    )
+
+    assert updated is not first
+    assert updated.revision == first.revision + 1
+    assert "Updated public title" in plugin.render_task_card(updated)
