@@ -10,17 +10,26 @@ from typing import Any, List
 MAX_NORMALIZED_TEXT_LENGTH = 65_536
 MAX_CONTENT_LIST_SIZE = 1_000
 _VISIBLE_TEXT_TYPES = frozenset({"text", "input_text", "output_text", "summary_text"})
-_LEAKAGE_FIELD_HINTS = frozenset({
+_KNOWN_STRUCTURED_TYPES = _VISIBLE_TEXT_TYPES | frozenset({
+    "message",
+    "tool_use",
+    "tool_result",
+    "thinking",
+    "reasoning",
+    "image",
+    "input_image",
+    "output_image",
+    "audio",
+    "input_audio",
+    "output_audio",
+})
+_LEAKAGE_ANCHOR_FIELDS = frozenset({
     "events",
-    "created_at",
     "run_id",
-    "tenant",
-    "assignee",
-    "status",
     "worker_context",
     "workspace_path",
-    "metadata",
-    "summary",
+    "tenant",
+    "assignee",
 })
 _REPR_TEXT_PATTERN = re.compile(
     r"(?s)[A-Za-z_][A-Za-z0-9_]*\((?=[^)]*\btype=(['\"])(text|input_text|output_text|summary_text)\1)(?=[^)]*\btext=(['\"])(.*?)\3)[^)]*\)"
@@ -31,29 +40,41 @@ def _truncate_text(text: str) -> str:
     return text[:MAX_NORMALIZED_TEXT_LENGTH] if len(text) > MAX_NORMALIZED_TEXT_LENGTH else text
 
 
-def _looks_like_leak_payload(parsed: Any, original_text: str = "") -> bool:
+def _leak_anchor_fields(parsed: Any, *, _depth: int = 0) -> set[str]:
+    if _depth > 4:
+        return set()
     if isinstance(parsed, dict):
-        keys = {str(k) for k in parsed.keys()}
-        return bool(keys & _LEAKAGE_FIELD_HINTS)
+        found = {str(key) for key in parsed if str(key) in _LEAKAGE_ANCHOR_FIELDS}
+        for value in list(parsed.values())[:20]:
+            found.update(_leak_anchor_fields(value, _depth=_depth + 1))
+        return found
     if isinstance(parsed, list):
-        if not parsed:
-            return False
-        if any(isinstance(item, dict) and _looks_like_leak_payload(item) for item in parsed[:20]):
-            return True
-    lowered = original_text.lower()
-    return any(f'"{key}"' in lowered or f"'{key}'" in lowered for key in _LEAKAGE_FIELD_HINTS)
+        found: set[str] = set()
+        for item in parsed[:20]:
+            found.update(_leak_anchor_fields(item, _depth=_depth + 1))
+        return found
+    return set()
 
 
-def _has_structured_type_markers(parsed: Any) -> bool:
+def _looks_like_leak_payload(parsed: Any) -> bool:
+    """Recognize internal run payloads without treating ordinary JSON as leaks."""
+    anchors = _leak_anchor_fields(parsed)
+    return "events" in anchors and bool(
+        anchors & {"run_id", "worker_context", "workspace_path", "tenant", "assignee"}
+    )
+
+
+def _has_recognized_typed_wrapper(parsed: Any) -> bool:
     if isinstance(parsed, dict):
-        if "type" in parsed:
+        item_type = str(parsed.get("type") or "").strip().lower()
+        if item_type in _KNOWN_STRUCTURED_TYPES:
             return True
         for key in ("content", "output"):
-            if key in parsed and _has_structured_type_markers(parsed.get(key)):
+            if key in parsed and _has_recognized_typed_wrapper(parsed.get(key)):
                 return True
         return False
     if isinstance(parsed, list):
-        return any(_has_structured_type_markers(item) for item in parsed[:50])
+        return any(_has_recognized_typed_wrapper(item) for item in parsed[:50])
     return False
 
 
@@ -75,9 +96,10 @@ def normalize_visible_text(content: Any, *, _max_depth: int = 10, _depth: int = 
         return ""
 
     if isinstance(content, str):
-        text = content.strip()
+        original_text = content
+        text = original_text.strip()
         if not text:
-            return ""
+            return _truncate_text(original_text)
 
         repr_text = _extract_repr_text(text)
         if repr_text:
@@ -89,17 +111,18 @@ def normalize_visible_text(content: Any, *, _max_depth: int = 10, _depth: int = 
                     parsed = parser(text)
                 except Exception:
                     continue
-                normalized = normalize_visible_text(parsed, _max_depth=_max_depth, _depth=_depth + 1)
-                if normalized:
-                    return normalized
-                if isinstance(parsed, (list, dict)) and (
-                    _looks_like_leak_payload(parsed, text) or _has_structured_type_markers(parsed)
-                ):
+                if _has_recognized_typed_wrapper(parsed):
+                    return normalize_visible_text(
+                        parsed,
+                        _max_depth=_max_depth,
+                        _depth=_depth + 1,
+                    )
+                if _looks_like_leak_payload(parsed):
                     return ""
                 if isinstance(parsed, (list, dict)):
                     break
 
-        return _truncate_text(text)
+        return _truncate_text(original_text)
 
     if isinstance(content, list):
         parts: List[str] = []
@@ -135,6 +158,8 @@ def normalize_visible_text(content: Any, *, _max_depth: int = 10, _depth: int = 
         return _truncate_text(str(text)) if text else ""
     if item_type == "message" and hasattr(content, "content"):
         return normalize_visible_text(getattr(content, "content"), _max_depth=_max_depth, _depth=_depth + 1)
+    if item_type in _KNOWN_STRUCTURED_TYPES:
+        return ""
     if hasattr(content, "role") and hasattr(content, "content"):
         return normalize_visible_text(getattr(content, "content"), _max_depth=_max_depth, _depth=_depth + 1)
 
