@@ -228,7 +228,7 @@ async def test_idle_expiry_fires_finalize_hook(mock_invoke_hook):
     runner._cleanup_agent_resources = MagicMock()
     runner._sweep_idle_cached_agents = MagicMock(return_value=0)
 
-    # The watcher starts with `await asyncio.sleep(60)` and loops while
+    # The watcher starts with `await asyncio.sleep(0.2)` and loops while
     # `self._running`.  Patch sleep so the 60s initial delay is instant, and
     # make the expiry hook invocation flip `_running` false so the loop
     # exits cleanly after one pass.

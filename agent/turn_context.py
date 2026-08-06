@@ -34,11 +34,14 @@ from typing import Any, Dict, List, Mapping, Optional
 from agent.conversation_compression import (
     IDLE_COMPACTION_STATUS_TEMPLATE,
     PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
+    compression_skipped_due_to_lock,
     conversation_history_after_compression,
+    recover_rotated_compression_session,
 )
 from agent.context_engine import automatic_compaction_status_message
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import build_memory_context_block
+from agent.memory_provider import is_trivial_prompt
 from agent.model_metadata import (
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
@@ -193,7 +196,7 @@ def reanchor_current_turn_user_idx(messages: List[Any], user_message: Any) -> in
     return fallback
 
 
-def _compression_made_progress(
+def compression_made_progress(
     orig_len: int, new_len: int, orig_tokens: int, new_tokens: int
 ) -> bool:
     """Return ``True`` if a compression pass materially reduced the request.
@@ -214,6 +217,13 @@ def _compression_made_progress(
     if new_len < orig_len:
         return True
     return orig_tokens > 0 and new_tokens < orig_tokens * 0.95
+
+
+# Back-compat alias: this predicate was module-private until the gateway's
+# session-hygiene recovery gate needed the same semantics (#79624).  Keeping the
+# old name bound means existing callers and any test that patches
+# ``_compression_made_progress`` continue to work unchanged.
+_compression_made_progress = compression_made_progress
 
 
 def _compression_warrants_another_preflight_pass(
@@ -334,6 +344,8 @@ def build_turn_context(
     persist_user_message: Optional[Any],
     persist_user_timestamp: Optional[float] = None,
     *,
+    persist_user_display_kind: Optional[str] = None,
+    persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     restore_or_build_system_prompt,
     install_safe_stdio,
     sanitize_surrogates,
@@ -351,6 +363,13 @@ def build_turn_context(
     """
     # Guard stdio against OSError from broken pipes (systemd/headless/daemon).
     install_safe_stdio()
+
+    # Recover a session rotated by another path before binding log/turn ids or
+    # copying client-supplied history. Everything in this turn must consistently
+    # belong to the canonical child, including observability metadata.
+    recovered_history = recover_rotated_compression_session(agent)
+    if recovered_history is not None:
+        conversation_history = recovered_history
 
     # NOTE: the DB session row is created later, AFTER the system prompt is
     # restored/built (see _ensure_db_session() below the system-prompt block).
@@ -381,6 +400,7 @@ def build_turn_context(
             api_key=getattr(agent, "api_key", "") or "",
             api_mode=getattr(agent, "api_mode", "") or "",
             auth_mode=getattr(agent, "auth_mode", "") or "",
+            session_id=getattr(agent, "session_id", "") or "",
         )
     except Exception:
         pass
@@ -427,7 +447,12 @@ def build_turn_context(
     # Generate unique task_id if not provided to isolate VMs between tasks.
     effective_task_id = task_id or str(uuid.uuid4())
     agent._current_task_id = effective_task_id
-    turn_id = f"{agent.session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
+    turn_id = str(getattr(agent, "_relay_pending_turn_id", "") or "")
+    if not turn_id:
+        turn_id = (
+            f"{agent.session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
+        )
+    agent._relay_pending_turn_id = None
     agent._current_turn_id = turn_id
     agent._current_api_request_id = ""
     # Tripwire: warn (with both turn ids) when this turn starts before the
@@ -528,6 +553,19 @@ def build_turn_context(
     # Add the current user message after the prompt/session setup has made
     # close persistence safe. The handoff above preserves any marker already
     # stamped by an earlier close flush.
+    #
+    # A synthesized turn (auto-continue recovery note, delegation completion)
+    # declares how it should READ in a transcript. Stamp that on the live
+    # message so the crash persist below writes the row already typed. Typing
+    # it after the turn instead leaves the row untyped for the whole run — and
+    # forever if the turn crashes — so the raw system note paints as a user
+    # bubble. The model still receives role/content unchanged; the api_messages
+    # build strips both fields from every outgoing copy.
+    if persist_user_display_kind:
+        user_msg["display_kind"] = persist_user_display_kind
+        if persist_user_display_metadata:
+            user_msg["display_metadata"] = persist_user_display_metadata
+
     messages.append(user_msg)
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx
@@ -705,6 +743,8 @@ def build_turn_context(
     # issue #27405 (a few very large messages slipping past the count gate).
     _preflight_compressed = False
     _preflight_compression_blocked = False
+    agent._turn_received_provider_response = False
+    agent._turn_preflight_display_snapshot = None
     if agent.compression_enabled and _should_run_preflight_estimate(
         messages,
         agent.context_compressor.protect_first_n,
@@ -717,6 +757,21 @@ def build_turn_context(
             tools=agent.tools or None,
         )
         _compressor = agent.context_compressor
+        # getattr guard: minimal compressor doubles (SimpleNamespace in the
+        # engine-preflight tests) and plugin context engines lack this
+        # ContextCompressor-only method — absence means no snapshot, and the
+        # finalizer's rollback stays disarmed for the turn (display-only).
+        _snapshot_fn = getattr(
+            _compressor, "snapshot_preflight_display_tokens", None
+        )
+        if callable(_snapshot_fn):
+            _snapshot_val = _snapshot_fn()
+            # Type pin: MagicMock compressors return truthy Mock objects —
+            # only a real int snapshot may arm the interrupted-turn rollback.
+            if isinstance(_snapshot_val, int) and not isinstance(
+                _snapshot_val, bool
+            ):
+                agent._turn_preflight_display_snapshot = _snapshot_val
         _defer_preflight = getattr(
             _compressor,
             "should_defer_preflight_to_real_usage",
@@ -833,10 +888,29 @@ def build_turn_context(
             for _pass in range(_max_preflight_passes):
                 _orig_len = len(messages)
                 _orig_tokens = _preflight_tokens
+                _preflight_input = messages
                 messages, active_system_prompt = agent._compress_context(
                     messages, system_message, approx_tokens=_preflight_tokens,
                     task_id=effective_task_id,
                 )
+                if (
+                    messages is _preflight_input
+                    and compression_skipped_due_to_lock(agent)
+                ):
+                    # #69870 lock-skip: another path holds this session's
+                    # compression lock, so the pass no-oped. That is a
+                    # temporary DEFER, not proof the transcript cannot
+                    # compress — do NOT arm the insufficient-progress
+                    # blocker (the loop's error handlers must keep their
+                    # provider-proven retry budget) and stop preflight
+                    # passes for this turn; the lock winner is shrinking
+                    # the same session concurrently.
+                    logger.info(
+                        "Preflight compression deferred: compression lock "
+                        "held by another path (session %s)",
+                        agent.session_id or "none",
+                    )
+                    break
                 # Re-estimate now so size-only compression (same row count,
                 # lower token count — e.g. summarising tool outputs) is
                 # recognised as progress instead of being misread as
@@ -985,7 +1059,7 @@ def build_turn_context(
     # Plugin hook: pre_llm_call (context injected into user message, not system prompt).
     plugin_user_context = ""
     try:
-        from hermes_cli.plugins import invoke_hook as _invoke_hook
+        from hermes_cli.lifecycle import invoke_hook as _invoke_hook
         _pre_results = _invoke_hook(
             "pre_llm_call",
             session_id=agent.session_id,
@@ -996,6 +1070,7 @@ def build_turn_context(
             is_first_turn=(not bool(conversation_history)),
             model=agent.model,
             platform=getattr(agent, "platform", None) or "",
+            parent_session_id=getattr(agent, "_parent_session_id", None) or "",
             sender_id=getattr(agent, "_user_id", None) or "",
         )
         _ctx_parts: list[str] = []
@@ -1086,11 +1161,15 @@ def build_turn_context(
             pass
 
     # External memory provider: prefetch once before the tool loop.
+    #
+    # Skip prefetch on trivial prompts (greetings, acknowledgements) to
+    # prevent memory-context injection on turns that carry no semantic signal.
     ext_prefetch_cache = ""
     if agent._memory_manager:
         try:
             _query = original_user_message if isinstance(original_user_message, str) else ""
-            ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
+            if not is_trivial_prompt(_query):
+                ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
         except Exception:
             pass
 

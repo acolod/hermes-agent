@@ -137,7 +137,6 @@ def test_cmd_chat_forwards_todo_snapshot_path_to_cli(monkeypatch):
 
     assert captured["todo_snapshot_path"] == "/tmp/todo-snapshot.json"
 
-
 def test_continue_worktree_and_skills_flags_work_together(monkeypatch):
     import hermes_cli.main as main_mod
 
