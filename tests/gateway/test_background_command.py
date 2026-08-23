@@ -42,6 +42,10 @@ def _make_runner():
     runner._register_background_task_ledger = GatewayRunner._register_background_task_ledger.__get__(runner)
 
     mock_store = MagicMock()
+    # A real SessionStore returns None when no persisted /model override exists.
+    # MagicMock's default truthy return would otherwise rehydrate a fake model
+    # and make the session-scoped reasoning resolver receive a MagicMock.
+    mock_store.get_model_override.return_value = None
     runner.session_store = mock_store
 
     from gateway.hooks import HookRegistry
