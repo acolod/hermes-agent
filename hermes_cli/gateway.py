@@ -3906,6 +3906,8 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
         # byte-identical units instead of perpetually disagreeing about PATH.
         common_bin_path_set = set(common_bin_paths)
         path_entries = [p for p in path_entries if p not in common_bin_path_set]
+        user_local_paths = _build_user_local_paths(Path(home_dir), path_entries)
+        fixed_path_set = common_bin_path_set | set(user_local_paths)
         # Managed Node for the TARGET user's tree (see the skip above): probe
         # the remapped hermes_home, not the calling user's. Prepend — the
         # managed Node must outrank remapped shell-PATH entries, matching the
@@ -3914,10 +3916,16 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
         _append_node_dir_for_service(
             _target_node_entries, Path(hermes_home) if hermes_home else None
         )
+        # A missing managed Node tree may fall back to the invoker's PATH.
+        # Canonical system dirs and target-user local dirs are appended below
+        # in fixed order, so neither may be reintroduced by that fallback.
+        _target_node_entries = [
+            e for e in _target_node_entries if e not in fixed_path_set
+        ]
         path_entries = [
             e for e in _target_node_entries if e not in path_entries
         ] + path_entries
-        path_entries.extend(_build_user_local_paths(Path(home_dir), path_entries))
+        path_entries.extend(user_local_paths)
         path_entries.extend(_build_wsl_interop_paths(path_entries))
         path_entries.extend(common_bin_paths)
         sane_path = ":".join(path_entries)

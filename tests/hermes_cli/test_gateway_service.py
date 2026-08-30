@@ -1488,13 +1488,17 @@ class TestGeneratedUnitIncludesLocalBin:
             "_system_service_identity",
             lambda run_as_user=None: ("alex", "alex", str(target_home)),
         )
+        local_bin = str(target_home / ".local" / "bin")
         monkeypatch.setattr(
             gateway_cli,
             "_build_user_local_paths",
-            lambda home_path, existing: [str(home_path / ".local" / "bin")],
+            lambda home_path, existing: [] if local_bin in existing else [local_bin],
         )
+        node_fallbacks = iter(["/usr/bin", local_bin])
         monkeypatch.setattr(
-            gateway_cli, "_append_node_dir_for_service", lambda entries, root=None: None
+            gateway_cli,
+            "_append_node_dir_for_service",
+            lambda entries, root=None: entries.append(next(node_fallbacks)),
         )
         monkeypatch.setattr(
             gateway_cli, "_build_wsl_interop_paths", lambda existing: []
