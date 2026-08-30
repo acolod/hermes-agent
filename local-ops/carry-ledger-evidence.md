@@ -6,22 +6,29 @@ Live repository inspected: `/home/alex/.hermes/hermes-agent`
 
 Candidate worktree: `/home/alex/workspace/worktrees/hermes-carry-audit-closure-20260829`
 
-This record was produced from existing local Git objects and refs only. No
-`fetch`, `pull`, service action, profile write, or live runtime change was
-performed. No deployment ref, remote ref, scheduler entry, service, or runtime
-configuration was changed while reconstructing this snapshot.
+The initial reconstruction used existing local Git objects and refs only. During
+final review, an out-of-scope broad pytest run triggered `fetch origin main
+--quiet` at 2026-08-29 22:28:30 PDT and advanced only the local tracking ref.
+No remote ref, deployment source, scheduler entry, service, profile, or runtime
+configuration was changed by that fetch. The deterministic audit itself was
+verified before and after execution to leave refs and worktree state unchanged.
 
 ## Ref snapshot
 
 - Reconstruction baseline: `6d6b2cf7892598abd1bd60b10fdc3ccb71562de2`
 - Audit implementation: `db60f03cd3dd4b7a98806b8172d41e8194a73c29`
-- Locally known `origin/main`: `00bbfc690060d1323ddb2f065297c7425cb71c26`
+- Locally known `origin/main`: `26350357d76e4508c8df9304a3374bdc5a6f6220`
 - Merge-base: `baa344dee76993f0444c18fc59a69738ccb339d0`
-- Expected local divergence after ledger promotion: `origin/main...local/live` =
-  3 base-only commits and 65 live-only first-parent/merged-lane commits.
-- Expected first-parent lane after ledger promotion: 58 non-merge commits and
-  7 merge commits. The audit implementation is functional; the final
-  ledger/evidence commit is recognized structurally as ledger-only.
+- Expected local divergence after final evidence promotion:
+  `origin/main...local/live` = 299 base-only commits and 66 live-only
+  first-parent/merged-lane commits.
+- Expected first-parent lane after final evidence promotion: 59 non-merge
+  commits and 7 merge commits. The audit implementation is functional; the
+  ledger/evidence commits are recognized structurally as ledger-only.
+
+The `origin/main` OID and divergence counts above are timestamped observations,
+not immutable ledger identity. They can advance after a separately authorized
+fetch. The merge and carry manifests remain the durable integrity authority.
 
 The base and live refs have diverged; neither is an ancestor of the other. This
 is intentionally reported as unhealthy by the new audit. Resolving it belongs
