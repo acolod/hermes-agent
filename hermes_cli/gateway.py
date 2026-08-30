@@ -3901,6 +3901,11 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
         working_dir = str(hermes_home) if hermes_home else _remap_path_for_user(working_dir, home_dir)
         venv_dir = _remap_path_for_user(venv_dir, home_dir)
         path_entries = [_remap_path_for_user(p, home_dir) for p in path_entries]
+        # Common system directories are appended below in a fixed order. Drop
+        # invoker-derived copies first so sudo/root and the target user produce
+        # byte-identical units instead of perpetually disagreeing about PATH.
+        common_bin_path_set = set(common_bin_paths)
+        path_entries = [p for p in path_entries if p not in common_bin_path_set]
         # Managed Node for the TARGET user's tree (see the skip above): probe
         # the remapped hermes_home, not the calling user's. Prepend — the
         # managed Node must outrank remapped shell-PATH entries, matching the

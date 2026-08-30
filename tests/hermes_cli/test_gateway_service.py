@@ -1470,6 +1470,56 @@ class TestGeneratedUnitUsesDetectedVenv:
 class TestGeneratedUnitIncludesLocalBin:
     """~/.local/bin must be in PATH so uvx/pipx tools are discoverable."""
 
+    def test_system_unit_is_independent_of_invoker_common_path_order(
+        self, monkeypatch
+    ):
+        target_home = Path("/home/alex")
+        target_venv = target_home / ".hermes" / "hermes-agent" / "venv"
+        invoker_paths = [
+            ["/usr/bin", str(target_venv / "bin")],
+            [str(target_venv / "bin")],
+        ]
+
+        monkeypatch.setattr(
+            gateway_cli, "_build_service_path_dirs", lambda: invoker_paths.pop(0)
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_system_service_identity",
+            lambda run_as_user=None: ("alex", "alex", str(target_home)),
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_build_user_local_paths",
+            lambda home_path, existing: [str(home_path / ".local" / "bin")],
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_append_node_dir_for_service", lambda entries, root=None: None
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_build_wsl_interop_paths", lambda existing: []
+        )
+
+        root_like_unit = gateway_cli.generate_systemd_unit(
+            system=True, run_as_user="alex"
+        )
+        user_like_unit = gateway_cli.generate_systemd_unit(
+            system=True, run_as_user="alex"
+        )
+
+        assert root_like_unit == user_like_unit
+        path_line = next(
+            line
+            for line in root_like_unit.splitlines()
+            if line.startswith('Environment="PATH=')
+        )
+        path_entries = (
+            path_line.removeprefix('Environment="PATH=').removesuffix('"').split(":")
+        )
+        assert path_entries.index(str(target_home / ".local" / "bin")) < path_entries.index(
+            "/usr/bin"
+        )
+        assert path_entries.count("/usr/bin") == 1
 
     def test_system_unit_includes_local_bin_in_path(self, monkeypatch):
         monkeypatch.setattr(
